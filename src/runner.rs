@@ -25,16 +25,7 @@ impl Runner {
         let path = Path::new(&self.path);
         let buffer = fs::read(path).unwrap();
         let object = Object::parse(&buffer).unwrap();
-
-        let Object::Mach(mach_container) = object else {
-            error!("Not a mach binary");
-            return;
-        };
-
-        let Mach::Binary(mach) = mach_container else {
-            error!("not single mach binary");
-            return;
-        };
+        let mach = extract_mach(&object).unwrap();
 
         let mut emu = unicorn_engine::Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN)
             .expect("failed to initialize Unicorn instance");
@@ -191,6 +182,20 @@ impl Runner {
 
         info!("Program finished");
     }
+}
+
+fn extract_mach<'a, 'b>(object: &'b Object<'a>) -> Option<&'b MachO<'a>> {
+    let Object::Mach(mach_container) = object else {
+        error!("Not a mach binary");
+        return None;
+    };
+
+    if let Mach::Binary(mach) = mach_container {
+        return Some(mach);
+    }
+
+    error!("Not a single-arch mach binary, implement fat binaries");
+    None
 }
 
 fn map_mach_o_prot(prot: u32) -> Prot {

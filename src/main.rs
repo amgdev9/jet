@@ -1,18 +1,34 @@
-use simplelog::{Config, LevelFilter, WriteLogger};
-use std::fs::File;
+use std::env;
+
+use flexi_logger::{Age, Cleanup, Criterion, FileSpec, Logger, Naming};
 
 use crate::runner::Runner;
 
 mod runner;
 
 fn main() {
-    WriteLogger::init(
-        LevelFilter::Info,
-        Config::default(),
-        File::create("jet.log").unwrap(),
-    )
-    .unwrap();
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        panic!("Usage: {} <executable>", args[0]);
+    }
+    let program_path = &args[1];
 
-    let runner = Runner::new("./test".into());
+    Logger::try_with_str("jet=debug")
+        .unwrap()
+        .log_to_file(
+            FileSpec::default()
+                .directory("logs")
+                .basename("output")
+                .suffix("log"),
+        )
+        .rotate(
+            Criterion::Age(Age::Second),
+            Naming::Numbers,
+            Cleanup::KeepLogFiles(0),
+        )
+        .start()
+        .unwrap();
+
+    let runner = Runner::new(program_path.to_string());
     runner.run();
 }
