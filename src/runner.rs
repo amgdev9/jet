@@ -35,7 +35,7 @@ impl Runner {
         }
     }
 
-    pub fn run(&self) {
+    pub fn run(&self, args: Vec<String>) {
         info!("Loading executable: {}", self.path);
         let path = Path::new(&self.path);
         let buffer = fs::read(path).unwrap();
@@ -44,7 +44,7 @@ impl Runner {
 
         let mut emu = Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN).unwrap();
         map_segments(mach, &buffer, &mut emu);
-        setup_stack(&mut emu);
+        setup_stack(&mut emu, &args);
         let indirect_symbol_table = get_indirect_symbol_table(mach, &buffer);
 
         // Find unresolved symbols
@@ -235,7 +235,7 @@ impl Runner {
         })
         .unwrap();
 
-        info!("Running program...");
+        info!("Running program at {:#x}...", mach.entry);
         emu.emu_start(mach.entry, STACK_TOP, 0, 0).unwrap();
 
         info!("Program finished!");
@@ -314,11 +314,42 @@ fn get_indirect_symbol_table(mach: &MachO<'_>, buffer: &Vec<u8>) -> Vec<u32> {
         .collect();
 }
 
-fn setup_stack(emu: &mut Unicorn<'_, ()>) {
+fn setup_stack(emu: &mut Unicorn<'_, ()>, args: &Vec<String>) {
     info!("Stack: Base: {:#x} Size: {:#x}", STACK_BASE, STACK_SIZE);
     emu.mem_map(STACK_BASE as u64, STACK_SIZE, Prot::READ | Prot::WRITE)
         .unwrap();
-    emu.reg_write(RegisterARM64::SP, STACK_TOP).unwrap();
+
+    // Setup program arguments
+    emu.reg_write(RegisterARM64::X0, args.len() as u64).unwrap();
+    let args_size = args
+        .iter()
+        .map(|it| it.len() + 1) // +1 for null terminator
+        .sum::<usize>()
+        + ADDRESS_SIZE * (args.len() + 1);
+
+    // Copy argv to the stack
+    let sp = STACK_TOP - args_size as u64;
+    emu.reg_write(RegisterARM64::SP, sp).unwrap();
+
+    let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len() + 1);
+    let mut string_addr = sp + ((args.len() + 1) * ADDRESS_SIZE) as u64; // space for pointers
+
+    for arg in args {
+        argv_ptrs.push(string_addr);
+        let bytes = arg.as_bytes();
+        emu.mem_write(string_addr, &[bytes, &[0]].concat()).unwrap();
+        string_addr += (bytes.len() + 1) as u64;
+    }
+    argv_ptrs.push(0); // NULL terminator
+
+    // Write argv pointers at the start of the stack space
+    for (i, ptr) in argv_ptrs.iter().enumerate() {
+        emu.mem_write(sp + (i * ADDRESS_SIZE) as u64, &ptr.to_le_bytes())
+            .unwrap();
+    }
+
+    // Set X1 = pointer to argv
+    emu.reg_write(RegisterARM64::X1, sp).unwrap();
 }
 
 fn map_mach_o_prot(prot: u32) -> Prot {
