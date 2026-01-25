@@ -8,4 +8,5 @@ flexi_logger = "0.31.8"
 goblin = { git = "https://github.com/amgdev9/goblin" }
 hex = "0.4.3"
 log = "0.4.29"
+range-alloc = "0.1.4"
 unicorn-engine = "2.1.5"

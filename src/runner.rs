@@ -2,14 +2,21 @@ use std::{fs, io, path::Path};
 
 use goblin::{
     Object,
-    mach::{Mach, MachO},
+    mach::{
+        Mach, MachO,
+        constants::{S_LAZY_SYMBOL_POINTERS, S_NON_LAZY_SYMBOL_POINTERS},
+        load_command::CommandVariant,
+        segment::Section,
+    },
 };
-use log::{debug, error, info};
-use unicorn_engine::{Arch, Mode, Prot, RegisterARM64};
+use log::{debug, error, info, trace};
+use unicorn_engine::{Arch, Mode, Prot, RegisterARM64, Unicorn};
 
-const STACK_SIZE: u64 = 8 << 20;
+const STACK_SIZE: u64 = 8 << 20; // Not growable
 const STACK_TOP: u64 = 0x7fff_ffff_ffff;
 const STACK_BASE: u64 = STACK_TOP - STACK_SIZE + 1;
+
+const SVC_OPCODE: [u8; 4] = [0x01, 0x00, 0x00, 0xD4];
 
 pub struct Runner {
     path: String,
@@ -27,75 +34,55 @@ impl Runner {
         let object = Object::parse(&buffer).unwrap();
         let mach = extract_mach(&object).unwrap();
 
-        let mut emu = unicorn_engine::Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN)
-            .expect("failed to initialize Unicorn instance");
+        let mut emu = Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN).unwrap();
+        map_segments(mach, &buffer, &mut emu);
+        setup_stack(&mut emu);
+        let indirect_symbol_table = get_indirect_symbol_table(mach, &buffer);
 
-        // Map segments to virtual memory
-        mach.segments.iter().for_each(|it| {
-            let start_addr = it.vmaddr;
-            let vm_size = it.vmsize;
-            let prot = map_mach_o_prot(it.initprot);
-            println!("Segment: {:#x} {:#x} {:#x}", start_addr, vm_size, prot.0);
-
-            if it.filesize > 0 {
-                emu.mem_map(start_addr, vm_size, prot)
-                    .expect("failed to map code page");
-
-                let data = &buffer[it.fileoff as usize..(it.fileoff + it.filesize) as usize];
-                emu.mem_write(start_addr, data)
-                    .expect("failed to write instructions");
-                debug!(
-                    "Copied {:#x} bytes from {:#x} to {:#x}",
-                    data.len(),
-                    it.fileoff,
-                    start_addr
-                );
-            }
-        });
-
-        // Setup stack
-        info!("Stack: Base: {:#x} Size: {:#x}", STACK_BASE, STACK_SIZE);
-        emu.mem_map(STACK_BASE as u64, STACK_SIZE, Prot::READ | Prot::WRITE)
-            .expect("failed to map stack");
-        emu.reg_write(RegisterARM64::SP, STACK_TOP)
-            .expect("failed to set sp register");
-
-        let entrypoint_addr = mach.entry;
-
-        // Setup __got and resolve symbols now (they have flags = 6 so its S_NON_LAZY_SYMBOL_POINTERS)
-        let got = mach
+        // Find unresolved symbols
+        let sections_with_unresolved_symbols: Vec<Section> = mach
             .segments
             .iter()
             .flat_map(|it| it.sections().unwrap())
-            .find(|(it, _)| return it.name().unwrap() == "__got")
-            .unwrap()
-            .0;
-        println!("__got: {:#x}, size = {:#x}", got.addr, got.size);
+            .filter(|(it, _)| {
+                it.flags == S_NON_LAZY_SYMBOL_POINTERS || it.flags == S_LAZY_SYMBOL_POINTERS
+            })
+            .map(|it| it.0)
+            .collect();
 
-        // Dump Indirect symbol table in DysymtabCommand
+        info!("Sections with unresolved symbols:");
+        sections_with_unresolved_symbols.iter().for_each(|it| {
+            info!(
+                "{} at {:#x} num_unresolved_symbol_addresses: {} reserved1: {}",
+                it.name().unwrap(),
+                it.addr,
+                it.size / size_of::<u64>() as u64,
+                it.reserved1
+            );
+        });
 
-        // - Look for sections of type S_NON_LAZY_SYMBOL_POINTERS or S_LAZY_SYMBOL_POINTERS
-        // For each section:
-        // - num_unresolved_symbol_addresses = (section.size / sizeof(u64))
-        // For each unresolved symbol address:
-        // - symbol_index = indirect_symbol_table[section.reserved1 + i]
-        // So that means symbol_index <-> index i of section
-        //
-        // In this executable:
-        // 1 section = __got
-        // num_unresolved_symbol_addresses = 16 / 8 = 2
-        // Index 0 of __got <-> symbol_index = indirect_symbol_table[2 + 0] = 2 (symbols[2] = _printf)
-        // Index 1 of __got <-> symbol_index = indirect_symbol_table[2 + 1] = 3 (symbols[3] = _scanf)
-        // __got = 0x100004000
+        info!("Unresolved symbols:");
+        sections_with_unresolved_symbols.iter().for_each(|it| {
+            let num_unresolved_symbol_addresses = it.size / size_of::<u64>() as u64;
+            for i in 0..num_unresolved_symbol_addresses {
+                let symbol_index = indirect_symbol_table[it.reserved1 as usize + i as usize];
+                let (symbol_name, _) = mach.symbols().nth(symbol_index as usize).unwrap().unwrap();
+                let address = it.addr + i * size_of::<u64>() as u64;
+                debug!("Symbol {}, resolution addr: {:#x}", symbol_name, address);
+            }
+        });
+
+        return; // WIP Uncomment and continue the refactor
+
         emu.mem_write(0x100004000, &[0, 0, 0, 0, 0, 0, 0, 0])
             .unwrap(); // _printf trampoline
         emu.mem_write(0x100004008, &[4, 0, 0, 0, 0, 0, 0, 0])
             .unwrap(); // _scanf trampoline
 
         emu.mem_map(0x00, 4 * 1024, Prot::ALL).unwrap();
-        emu.mem_write(0x00, &[0x01, 0x00, 0x00, 0xD4]).unwrap(); // _printf
-        emu.mem_write(0x04, &[0x01, 0x00, 0x00, 0xD4]).unwrap(); // _scanf
-        emu.mem_write(0x08, &[0x01, 0x00, 0x00, 0xD4]).unwrap(); // program end 
+        emu.mem_write(0x00, &SVC_OPCODE).unwrap(); // _printf
+        emu.mem_write(0x04, &SVC_OPCODE).unwrap(); // _scanf
+        emu.mem_write(0x08, &SVC_OPCODE).unwrap(); // program end 
         emu.reg_write(RegisterARM64::LR, 0x08).unwrap();
 
         emu.add_intr_hook(move |emu, interrupt| {
@@ -109,10 +96,11 @@ impl Runner {
                 emu.emu_stop().unwrap();
                 return;
             }
-            println!(
+            trace!(
                 "INTR: {:#x}, PC: {:#x}, Return: {:#x}",
                 interrupt, pc, return_addr
             );
+            // PC -> symbol name
             if pc == 0x00 {
                 println!("PRINTF");
                 let mut addr = emu.reg_read(RegisterARM64::X0).unwrap() as u64;
@@ -176,9 +164,7 @@ impl Runner {
         .unwrap();
 
         // Run the program
-        const PROGRAM_SIZE: u64 = 124;
-        emu.emu_start(entrypoint_addr, entrypoint_addr + PROGRAM_SIZE - 1, 0, 0)
-            .unwrap();
+        emu.emu_start(mach.entry, STACK_TOP, 0, 0).unwrap();
 
         info!("Program finished");
     }
@@ -196,6 +182,71 @@ fn extract_mach<'a, 'b>(object: &'b Object<'a>) -> Option<&'b MachO<'a>> {
 
     error!("Not a single-arch mach binary, implement fat binaries");
     None
+}
+
+fn map_segments(mach: &MachO<'_>, buffer: &[u8], emu: &mut Unicorn<'_, ()>) {
+    mach.segments
+        .iter()
+        .filter(|it| it.initprot != 0)
+        .for_each(|it| {
+            let prot = map_mach_o_prot(it.initprot);
+            info!(
+                "Segment({}): start_addr={:#x} vm_size={:#x} prot={:#b}",
+                it.name().unwrap(),
+                it.vmaddr,
+                it.vmsize,
+                prot.0
+            );
+
+            emu.mem_map(it.vmaddr, it.vmsize, prot)
+                .expect("failed to map code page");
+
+            if it.filesize > 0 {
+                let data = &buffer[it.fileoff as usize..(it.fileoff + it.filesize) as usize];
+                emu.mem_write(it.vmaddr, data).unwrap();
+                info!(
+                    "Copied {:#x} bytes from file at {:#x} to {:#x}",
+                    data.len(),
+                    it.fileoff,
+                    it.vmaddr
+                );
+            }
+        });
+}
+
+fn get_indirect_symbol_table(mach: &MachO<'_>, buffer: &Vec<u8>) -> Vec<u32> {
+    let dysymtab_command_maybe = mach
+        .load_commands
+        .iter()
+        .filter_map(|it| {
+            let CommandVariant::Dysymtab(command) = it.command else {
+                return None;
+            };
+            Some(command)
+        })
+        .next();
+    let Some(dysymtab_command) = dysymtab_command_maybe else {
+        error!("Dysymtab command not found");
+        std::process::exit(1);
+    };
+    info!(
+        "Indirect symbol table: {:#x} Entries: {}",
+        dysymtab_command.indirectsymoff, dysymtab_command.nindirectsyms
+    );
+    let start = dysymtab_command.indirectsymoff as usize;
+    let end = start + dysymtab_command.nindirectsyms as usize * size_of::<u32>();
+
+    return buffer[start..end]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+}
+
+fn setup_stack(emu: &mut Unicorn<'_, ()>) {
+    info!("Stack: Base: {:#x} Size: {:#x}", STACK_BASE, STACK_SIZE);
+    emu.mem_map(STACK_BASE as u64, STACK_SIZE, Prot::READ | Prot::WRITE)
+        .unwrap();
+    emu.reg_write(RegisterARM64::SP, STACK_TOP).unwrap();
 }
 
 fn map_mach_o_prot(prot: u32) -> Prot {
