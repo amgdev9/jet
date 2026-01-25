@@ -20,6 +20,7 @@ const STACK_BASE: u64 = STACK_TOP - STACK_SIZE + 1;
 const SVC_OPCODE: [u8; 4] = [0x01, 0x00, 0x00, 0xD4];
 const SVC_INT_NUMBER: u32 = 2;
 const INSTRUCTION_SIZE: usize = size_of::<u32>();
+const ADDRESS_SIZE: usize = size_of::<u64>();
 
 pub struct Runner {
     path: String,
@@ -97,7 +98,7 @@ impl Runner {
             .map(|it| *it)
             .collect();
         info!("Libraries to load: {:#?}", libs);
-        let mut host_libraries_baseaddr = vec![];
+        let mut libs_baseaddr = vec![];
         libs.iter().for_each(|path| {
             info!("Loading library: {}", path);
             let host_dynamic_library = self
@@ -116,24 +117,24 @@ impl Runner {
                 .map(|it| it.data.len())
                 .sum::<usize>();
             let functions_size =
-                (host_dynamic_library.function_handlers.len() as usize) * size_of::<u32>();
+                (host_dynamic_library.function_handlers.len() as usize) * INSTRUCTION_SIZE;
             let size = global_variables_size + functions_size;
             if size == 0 {
                 return;
             }
 
             let base_addr = allocator.mmap_alloc(&mut emu, size as u64).unwrap();
-            host_libraries_baseaddr.push(base_addr);
+            libs_baseaddr.push(base_addr);
             let num_functions = host_dynamic_library.function_handlers.len();
 
             // Write functions
             for i in 0..num_functions {
-                emu.mem_write(base_addr + (i * size_of::<u32>()) as u64, &SVC_OPCODE)
+                emu.mem_write(base_addr + (i * INSTRUCTION_SIZE) as u64, &SVC_OPCODE)
                     .unwrap();
             }
 
             // Write global variables
-            let mut base_variables = base_addr + (num_functions * size_of::<u32>()) as u64;
+            let mut base_variables = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
             for it in host_dynamic_library.global_variables.iter() {
                 emu.mem_write(base_variables, &it.data).unwrap();
                 base_variables += it.data.len() as u64;
@@ -147,25 +148,24 @@ impl Runner {
             for i in 0..num_unresolved_symbol_addresses {
                 let symbol_index = indirect_symbol_table[it.reserved1 as usize + i as usize];
                 let (symbol_name, _) = mach.symbols().nth(symbol_index as usize).unwrap().unwrap();
-                let address = it.addr + i * size_of::<u64>() as u64;
+                let address = it.addr + i * ADDRESS_SIZE as u64;
 
                 let host_library = self
                     .host_dynamic_libraries
                     .iter()
-                    .enumerate()
-                    .find(|(_, it)| it.function_handlers.iter().any(|it| it.name == symbol_name));
+                    .find(|it| it.function_handlers.iter().any(|it| it.name == symbol_name));
                 let Some(host_library) = host_library else {
                     error!("Symbol {} not found", symbol_name);
                     std::process::exit(1);
                 };
-                let (host_library_index, host_library) = host_library;
                 let function_index = host_library
                     .function_handlers
                     .iter()
                     .position(|it| it.name == symbol_name)
                     .unwrap();
-                let trampoline_address = host_libraries_baseaddr[host_library_index]
-                    + (function_index * INSTRUCTION_SIZE) as u64;
+                let libs_index = libs.iter().position(|it| it == &host_library.path).unwrap();
+                let trampoline_address =
+                    libs_baseaddr[libs_index] + (function_index * INSTRUCTION_SIZE) as u64;
                 emu.mem_write(address, &trampoline_address.to_le_bytes())
                     .unwrap();
                 debug!(
@@ -192,22 +192,27 @@ impl Runner {
             );
 
             // PC -> symbol name
-            let host_library =
-                self.host_dynamic_libraries
+            let lib = libs.iter().enumerate().find(|(index, lib)| {
+                let base_addr = libs_baseaddr[*index];
+                let host_lib = self
+                    .host_dynamic_libraries
                     .iter()
-                    .enumerate()
-                    .find(|(index, it)| {
-                        let base_addr = host_libraries_baseaddr[*index];
-                        let num_functions = it.function_handlers.len();
-                        let end_addr = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
-                        return pc >= base_addr && pc < end_addr;
-                    });
-            let Some(host_library) = host_library else {
+                    .find(|it| it.path == lib.to_string())
+                    .unwrap();
+                let num_functions = host_lib.function_handlers.len();
+                let end_addr = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
+                return pc >= base_addr && pc < end_addr;
+            });
+            let Some(lib) = lib else {
                 panic!("Symbol at PC={:#x} not found", pc);
             };
-            let (host_library_index, host_library) = host_library;
-            let function_index =
-                (pc - host_libraries_baseaddr[host_library_index]) / INSTRUCTION_SIZE as u64;
+            let (libs_index, lib) = lib;
+            let host_library = self
+                .host_dynamic_libraries
+                .iter()
+                .find(|it| it.path == lib.to_string())
+                .unwrap();
+            let function_index = (pc - libs_baseaddr[libs_index]) / INSTRUCTION_SIZE as u64;
             let function_name = &host_library.function_handlers[function_index as usize].name;
 
             let mut processed = false;
@@ -230,9 +235,10 @@ impl Runner {
         })
         .unwrap();
 
+        info!("Running program...");
         emu.emu_start(mach.entry, STACK_TOP, 0, 0).unwrap();
 
-        info!("Program finished");
+        info!("Program finished!");
     }
 }
 

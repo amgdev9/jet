@@ -8,7 +8,7 @@ pub struct HostDynamicLibrary {
 
 pub struct FunctionHandler {
     pub name: String,
-    pub handler: fn(&Unicorn<'_, ()>)
+    pub handler: fn(&mut Unicorn<'_, ()>)
 }
 
 pub struct GlobalVariable {
