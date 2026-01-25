@@ -22,6 +22,8 @@ const SVC_INT_NUMBER: u32 = 2;
 const INSTRUCTION_SIZE: usize = size_of::<u32>();
 const ADDRESS_SIZE: usize = size_of::<u64>();
 
+const MAX_HEAP_SIZE: u64 = 2 << 40; // 2TB
+
 pub struct Runner {
     path: String,
     host_dynamic_libraries: Vec<HostDynamicLibrary>,
@@ -35,7 +37,7 @@ impl Runner {
         }
     }
 
-    pub fn run(&self, args: Vec<String>) {
+    pub fn run(&self, args: Vec<String>, env: Vec<String>) {
         info!("Loading executable: {}", self.path);
         let path = Path::new(&self.path);
         let buffer = fs::read(path).unwrap();
@@ -44,7 +46,7 @@ impl Runner {
 
         let mut emu = Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN).unwrap();
         map_segments(mach, &buffer, &mut emu);
-        setup_stack(&mut emu, &args);
+        setup_stack(&mut emu, &args, &env);
         let indirect_symbol_table = get_indirect_symbol_table(mach, &buffer);
 
         // Find unresolved symbols
@@ -77,7 +79,7 @@ impl Runner {
             .map(|it| it.vmaddr + it.vmsize)
             .max()
             .unwrap();
-        let mmap_start = heap_start + (2 << 40); // 2TB for program break
+        let mmap_start = heap_start + MAX_HEAP_SIZE;
         let mmap_end = STACK_BASE;
         let mut allocator = Allocator::new(heap_start, mmap_start, mmap_end);
         info!("Program break: {:#x} - {:#x}", heap_start, mmap_start - 1);
@@ -314,42 +316,52 @@ fn get_indirect_symbol_table(mach: &MachO<'_>, buffer: &Vec<u8>) -> Vec<u32> {
         .collect();
 }
 
-fn setup_stack(emu: &mut Unicorn<'_, ()>, args: &Vec<String>) {
+fn setup_stack(emu: &mut Unicorn<'_, ()>, args: &Vec<String>, env: &Vec<String>) {
     info!("Stack: Base: {:#x} Size: {:#x}", STACK_BASE, STACK_SIZE);
     emu.mem_map(STACK_BASE as u64, STACK_SIZE, Prot::READ | Prot::WRITE)
         .unwrap();
 
-    // Setup program arguments
-    emu.reg_write(RegisterARM64::X0, args.len() as u64).unwrap();
-    let args_size = args
-        .iter()
-        .map(|it| it.len() + 1) // +1 for null terminator
-        .sum::<usize>()
-        + ADDRESS_SIZE * (args.len() + 1);
+    let argc = args.len() as u64;
+    emu.reg_write(RegisterARM64::X0, argc).unwrap();
 
-    // Copy argv to the stack
-    let sp = STACK_TOP - args_size as u64;
+    let argv_ptr_count = args.len() + 1;
+    let envp_ptr_count = env.len() + 1;
+
+    let strings_size: usize = args.iter().chain(env.iter()).map(|s| s.len() + 1).sum();
+
+    let ptrs_size = (argv_ptr_count + envp_ptr_count) * std::mem::size_of::<u64>();
+
+    let total_size = strings_size + ptrs_size;
+
+    let sp = STACK_TOP - total_size as u64;
     emu.reg_write(RegisterARM64::SP, sp).unwrap();
 
-    let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len() + 1);
-    let mut string_addr = sp + ((args.len() + 1) * ADDRESS_SIZE) as u64; // space for pointers
+    let argv_base = sp;
+    let envp_base = argv_base + (argv_ptr_count * 8) as u64;
+    let mut str_base = envp_base + (envp_ptr_count * 8) as u64;
 
-    for arg in args {
-        argv_ptrs.push(string_addr);
-        let bytes = arg.as_bytes();
-        emu.mem_write(string_addr, &[bytes, &[0]].concat()).unwrap();
-        string_addr += (bytes.len() + 1) as u64;
-    }
-    argv_ptrs.push(0); // NULL terminator
-
-    // Write argv pointers at the start of the stack space
-    for (i, ptr) in argv_ptrs.iter().enumerate() {
-        emu.mem_write(sp + (i * ADDRESS_SIZE) as u64, &ptr.to_le_bytes())
+    for (i, arg) in args.iter().enumerate() {
+        emu.mem_write(argv_base + (i * 8) as u64, &str_base.to_le_bytes())
             .unwrap();
+        emu.mem_write(str_base, &[arg.as_bytes(), &[0]].concat())
+            .unwrap();
+        str_base += (arg.len() + 1) as u64;
     }
+    emu.mem_write(argv_base + (args.len() * 8) as u64, &0u64.to_le_bytes())
+        .unwrap();
 
-    // Set X1 = pointer to argv
-    emu.reg_write(RegisterARM64::X1, sp).unwrap();
+    for (i, var) in env.iter().enumerate() {
+        emu.mem_write(envp_base + (i * 8) as u64, &str_base.to_le_bytes())
+            .unwrap();
+        emu.mem_write(str_base, &[var.as_bytes(), &[0]].concat())
+            .unwrap();
+        str_base += (var.len() + 1) as u64;
+    }
+    emu.mem_write(envp_base + (env.len() * 8) as u64, &0u64.to_le_bytes())
+        .unwrap();
+
+    emu.reg_write(RegisterARM64::X1, argv_base).unwrap();
+    emu.reg_write(RegisterARM64::X2, envp_base).unwrap();
 }
 
 fn map_mach_o_prot(prot: u32) -> Prot {

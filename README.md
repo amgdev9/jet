@@ -4,5 +4,3 @@ This is a PoC of trying to run Mach-O executables on Linux for different archite
 
 For this proof of concept, we will be running ARM64 binaries on x86_64 Linux. This runner does not adhere to any specific ABI and it's up to the user of this crate to implement it.
 
-TODO:
-- Make argc, argv and envp to work
