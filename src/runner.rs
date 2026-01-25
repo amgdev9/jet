@@ -118,6 +118,9 @@ impl Runner {
             let functions_size =
                 (host_dynamic_library.function_handlers.len() as usize) * size_of::<u32>();
             let size = global_variables_size + functions_size;
+            if size == 0 {
+                return;
+            }
 
             let base_addr = allocator.mmap_alloc(&mut emu, size as u64).unwrap();
             host_libraries_baseaddr.push(base_addr);
