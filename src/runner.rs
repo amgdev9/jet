@@ -1,5 +1,3 @@
-use std::{fs, io, path::Path};
-
 use goblin::{
     Object,
     mach::{
@@ -10,21 +8,30 @@ use goblin::{
     },
 };
 use log::{debug, error, info, trace};
+use std::{fs, path::Path};
 use unicorn_engine::{Arch, Mode, Prot, RegisterARM64, Unicorn};
+
+use crate::{allocator::Allocator, host_dynamic_library::HostDynamicLibrary};
 
 const STACK_SIZE: u64 = 8 << 20; // Not growable
 const STACK_TOP: u64 = 0x7fff_ffff_ffff;
 const STACK_BASE: u64 = STACK_TOP - STACK_SIZE + 1;
 
 const SVC_OPCODE: [u8; 4] = [0x01, 0x00, 0x00, 0xD4];
+const SVC_INT_NUMBER: u32 = 2;
+const INSTRUCTION_SIZE: usize = size_of::<u32>();
 
 pub struct Runner {
     path: String,
+    host_dynamic_libraries: Vec<HostDynamicLibrary>,
 }
 
 impl Runner {
-    pub fn new(path: String) -> Self {
-        Self { path }
+    pub fn new(path: String, host_dynamic_libraries: Vec<HostDynamicLibrary>) -> Self {
+        Self {
+            path,
+            host_dynamic_libraries,
+        }
     }
 
     pub fn run(&self) {
@@ -53,46 +60,126 @@ impl Runner {
         info!("Sections with unresolved symbols:");
         sections_with_unresolved_symbols.iter().for_each(|it| {
             info!(
-                "{} at {:#x} num_unresolved_symbol_addresses: {} reserved1: {}",
+                "{} at {:#x} num_unresolved_symbol_addresses: {} reserved1: {} flags: {}",
                 it.name().unwrap(),
                 it.addr,
                 it.size / size_of::<u64>() as u64,
-                it.reserved1
+                it.reserved1,
+                it.flags
             );
         });
 
-        info!("Unresolved symbols:");
+        // Initialize allocator
+        let heap_start = mach
+            .segments
+            .iter()
+            .map(|it| it.vmaddr + it.vmsize)
+            .max()
+            .unwrap();
+        let mmap_start = heap_start + (2 << 40); // 2TB for program break
+        let mmap_end = STACK_BASE;
+        let mut allocator = Allocator::new(heap_start, mmap_start, mmap_end);
+        info!("Program break: {:#x} - {:#x}", heap_start, mmap_start - 1);
+        info!("MMAP region: {:#x} - {:#x}", mmap_start, mmap_end);
+
+        // Setup program exit call
+        let exit_function = allocator
+            .mmap_alloc(&mut emu, size_of::<u32>() as u64)
+            .unwrap();
+        emu.mem_write(exit_function, &SVC_OPCODE).unwrap();
+        emu.reg_write(RegisterARM64::LR, exit_function).unwrap();
+
+        // Load libraries
+        let libs: Vec<&str> = mach
+            .libs
+            .iter()
+            .filter(|it| *it != &"self")
+            .map(|it| *it)
+            .collect();
+        info!("Libraries to load: {:#?}", libs);
+        let mut host_libraries_baseaddr = vec![];
+        libs.iter().for_each(|path| {
+            info!("Loading library: {}", path);
+            let host_dynamic_library = self
+                .host_dynamic_libraries
+                .iter()
+                .find(|it| it.path == *path);
+            let Some(host_dynamic_library) = host_dynamic_library else {
+                // TODO Implement loading compiled dynamic libraries
+                error!("Library {} not found", path);
+                std::process::exit(1);
+            };
+
+            let global_variables_size = host_dynamic_library
+                .global_variables
+                .iter()
+                .map(|it| it.data.len())
+                .sum::<usize>();
+            let functions_size =
+                (host_dynamic_library.function_handlers.len() as usize) * size_of::<u32>();
+            let size = global_variables_size + functions_size;
+
+            let base_addr = allocator.mmap_alloc(&mut emu, size as u64).unwrap();
+            host_libraries_baseaddr.push(base_addr);
+            let num_functions = host_dynamic_library.function_handlers.len();
+
+            // Write functions
+            for i in 0..num_functions {
+                emu.mem_write(base_addr + (i * size_of::<u32>()) as u64, &SVC_OPCODE)
+                    .unwrap();
+            }
+
+            // Write global variables
+            let mut base_variables = base_addr + (num_functions * size_of::<u32>()) as u64;
+            for it in host_dynamic_library.global_variables.iter() {
+                emu.mem_write(base_variables, &it.data).unwrap();
+                base_variables += it.data.len() as u64;
+            }
+        });
+
+        // Resolve undefined symbols
+        info!("Resolving undefined symbols...");
         sections_with_unresolved_symbols.iter().for_each(|it| {
             let num_unresolved_symbol_addresses = it.size / size_of::<u64>() as u64;
             for i in 0..num_unresolved_symbol_addresses {
                 let symbol_index = indirect_symbol_table[it.reserved1 as usize + i as usize];
                 let (symbol_name, _) = mach.symbols().nth(symbol_index as usize).unwrap().unwrap();
                 let address = it.addr + i * size_of::<u64>() as u64;
-                debug!("Symbol {}, resolution addr: {:#x}", symbol_name, address);
+
+                let host_library = self
+                    .host_dynamic_libraries
+                    .iter()
+                    .enumerate()
+                    .find(|(_, it)| it.function_handlers.iter().any(|it| it.name == symbol_name));
+                let Some(host_library) = host_library else {
+                    error!("Symbol {} not found", symbol_name);
+                    std::process::exit(1);
+                };
+                let (host_library_index, host_library) = host_library;
+                let function_index = host_library
+                    .function_handlers
+                    .iter()
+                    .position(|it| it.name == symbol_name)
+                    .unwrap();
+                let trampoline_address = host_libraries_baseaddr[host_library_index]
+                    + (function_index * INSTRUCTION_SIZE) as u64;
+                emu.mem_write(address, &trampoline_address.to_le_bytes())
+                    .unwrap();
+                debug!(
+                    "Resolved symbol {}, resolution addr: {:#x}, trampoline addr: {:#x}",
+                    symbol_name, address, trampoline_address
+                );
             }
         });
 
-        return; // WIP Uncomment and continue the refactor
-
-        emu.mem_write(0x100004000, &[0, 0, 0, 0, 0, 0, 0, 0])
-            .unwrap(); // _printf trampoline
-        emu.mem_write(0x100004008, &[4, 0, 0, 0, 0, 0, 0, 0])
-            .unwrap(); // _scanf trampoline
-
-        emu.mem_map(0x00, 4 * 1024, Prot::ALL).unwrap();
-        emu.mem_write(0x00, &SVC_OPCODE).unwrap(); // _printf
-        emu.mem_write(0x04, &SVC_OPCODE).unwrap(); // _scanf
-        emu.mem_write(0x08, &SVC_OPCODE).unwrap(); // program end 
-        emu.reg_write(RegisterARM64::LR, 0x08).unwrap();
-
         emu.add_intr_hook(move |emu, interrupt| {
-            if interrupt != 2 {
+            if interrupt != SVC_INT_NUMBER {
                 return;
             }
 
-            let pc = emu.reg_read(RegisterARM64::PC).unwrap() - 4; // PC is already incremented
+            let pc = emu.reg_read(RegisterARM64::PC).unwrap() - INSTRUCTION_SIZE as u64; // PC is already incremented
             let return_addr = emu.reg_read(RegisterARM64::LR).unwrap();
-            if pc == 0x08 {
+            if pc == exit_function {
                 emu.emu_stop().unwrap();
                 return;
             }
@@ -100,70 +187,46 @@ impl Runner {
                 "INTR: {:#x}, PC: {:#x}, Return: {:#x}",
                 interrupt, pc, return_addr
             );
+
             // PC -> symbol name
-            if pc == 0x00 {
-                println!("PRINTF");
-                let mut addr = emu.reg_read(RegisterARM64::X0).unwrap() as u64;
-                let mut buf: Vec<u8> = Vec::new();
+            let host_library =
+                self.host_dynamic_libraries
+                    .iter()
+                    .enumerate()
+                    .find(|(index, it)| {
+                        let base_addr = host_libraries_baseaddr[*index];
+                        let num_functions = it.function_handlers.len();
+                        let end_addr = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
+                        return pc >= base_addr && pc < end_addr;
+                    });
+            let Some(host_library) = host_library else {
+                panic!("Symbol at PC={:#x} not found", pc);
+            };
+            let (host_library_index, host_library) = host_library;
+            let function_index =
+                (pc - host_libraries_baseaddr[host_library_index]) / INSTRUCTION_SIZE as u64;
+            let function_name = &host_library.function_handlers[function_index as usize].name;
 
-                loop {
-                    let mut byte = [0u8; 1];
-                    emu.mem_read(addr, &mut byte).unwrap();
-
-                    if byte[0] == 0 {
-                        break;
-                    }
-
-                    buf.push(byte[0]);
-                    addr += 1;
+            let mut processed = false;
+            for library in self.host_dynamic_libraries.iter() {
+                if let Some(handler) = library
+                    .function_handlers
+                    .iter()
+                    .find(|it| it.name == *function_name)
+                {
+                    (handler.handler)(emu);
+                    processed = true;
                 }
-
-                let s = String::from_utf8_lossy(&buf);
-
-                if s.find("%d").is_none() {
-                    print!("{}", s);
-                } else {
-                    let sp = emu.reg_read(RegisterARM64::SP).unwrap();
-                    let mut buf = [0u8; 8];
-
-                    emu.mem_read(sp, &mut buf).unwrap();
-                    let arg = u64::from_le_bytes(buf);
-
-                    let formatted_str = s.replace("%d", &arg.to_string());
-                    print!("{}", formatted_str);
-                }
-            } else if pc == 0x04 {
-                println!("SCANF");
-
-                // Ignore X0, assume it's always "%d %d", args always come from stack
-                let sp = emu.reg_read(RegisterARM64::SP).unwrap();
-
-                let mut buf = [0u8; 8];
-
-                emu.mem_read(sp, &mut buf).unwrap();
-                let dst1 = u64::from_le_bytes(buf);
-
-                emu.mem_read(sp + 8, &mut buf).unwrap();
-                let dst2 = u64::from_le_bytes(buf);
-
-                println!("dst1: {:#x}, dst2: {:#x}", dst1, dst2);
-                let mut input = String::new();
-                io::stdin().read_line(&mut input).unwrap();
-
-                let mut it = input.split_whitespace();
-                let a: i32 = it.next().unwrap().parse().unwrap();
-                let b: i32 = it.next().unwrap().parse().unwrap();
-
-                emu.mem_write(dst1, &a.to_le_bytes()).unwrap();
-                emu.mem_write(dst2, &b.to_le_bytes()).unwrap();
-            } else {
-                panic!("Undefined symbol");
             }
+
+            if !processed {
+                panic!("Symbol {} not found", function_name);
+            }
+
             emu.reg_write(RegisterARM64::PC, return_addr).unwrap();
         })
         .unwrap();
 
-        // Run the program
         emu.emu_start(mach.entry, STACK_TOP, 0, 0).unwrap();
 
         info!("Program finished");
@@ -215,7 +278,7 @@ fn map_segments(mach: &MachO<'_>, buffer: &[u8], emu: &mut Unicorn<'_, ()>) {
 }
 
 fn get_indirect_symbol_table(mach: &MachO<'_>, buffer: &Vec<u8>) -> Vec<u32> {
-    let dysymtab_command_maybe = mach
+    let dysymtab_command = mach
         .load_commands
         .iter()
         .filter_map(|it| {
@@ -225,7 +288,7 @@ fn get_indirect_symbol_table(mach: &MachO<'_>, buffer: &Vec<u8>) -> Vec<u32> {
             Some(command)
         })
         .next();
-    let Some(dysymtab_command) = dysymtab_command_maybe else {
+    let Some(dysymtab_command) = dysymtab_command else {
         error!("Dysymtab command not found");
         std::process::exit(1);
     };
