@@ -53,7 +53,7 @@ impl MachOFile {
             .unwrap();
         let total_size = end_addr - start_addr;
         let base_address = allocator.alloc_unmapped(total_size).unwrap();
-        map_segments(segments, &buffer, emu);
+        map_segments(segments, &buffer, emu, base_address);
 
         // Fetch sections with unresolved symbols
         info!("Fetching sections with unresolved symbols...");
@@ -77,6 +77,10 @@ impl MachOFile {
             })
             .collect();
 
+        // Fetch indirect symbol table
+        info!("Fetching indirect symbol table...");
+        let indirect_symbol_table = get_indirect_symbol_table(&mach.load_commands, &buffer);
+
         // Load libraries
         let loaded_libs = mach
             .libs
@@ -88,51 +92,21 @@ impl MachOFile {
             })
             .map(|path| {
                 let host_lib = host_libs.iter().find(|it| it.path == *path);
-                let Some(host_lib) = host_lib else {
-                    // TODO Implement loading compiled dynamic libraries
-                    error!("Library {} not found", path);
-                    std::process::exit(1);
-                };
-
-                let global_variables_size = host_lib
-                    .global_variables
-                    .iter()
-                    .map(|it| it.data.len())
-                    .sum::<usize>();
-                let functions_size = (host_lib.function_handlers.len() as usize) * INSTRUCTION_SIZE;
-                let size = global_variables_size + functions_size;
-
-                let base_addr = allocator
-                    .alloc_mapped(emu, size as u64, Prot::ALL) // TODO Optimize permissions
-                    .unwrap();
-                let num_functions = host_lib.function_handlers.len();
-
-                // Write functions
-                for i in 0..num_functions {
-                    emu.mem_write(base_addr + (i * INSTRUCTION_SIZE) as u64, &SVC_OPCODE)
-                        .unwrap();
+                if let Some(host_lib) = host_lib {
+                    return load_host_library(host_lib, allocator, emu);
                 }
 
-                // Write global variables
-                let mut base_variables = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
-                for it in host_lib.global_variables.iter() {
-                    emu.mem_write(base_variables, &it.data).unwrap();
-                    base_variables += it.data.len() as u64;
-                }
-
-                return LoadedLibrary {
-                    base_address: base_addr,
-                    path: path.to_string(),
-                };
+                // TODO Implement loading compiled dynamic libraries
+                // TODO Prevent loading the same library twice
+                error!("Library {} not found", path);
+                std::process::exit(1);
             })
             .collect::<Vec<LoadedLibrary>>();
 
         // Resolve undefined symbols
         info!("Resolving undefined symbols...");
-        let indirect_symbol_table = get_indirect_symbol_table(&mach.load_commands, &buffer);
-
         sections_with_unresolved_symbols.iter().for_each(|it| {
-            let num_unresolved_symbol_addresses = it.size / size_of::<u64>() as u64;
+            let num_unresolved_symbol_addresses = it.size / ADDRESS_SIZE as u64;
             for i in 0..num_unresolved_symbol_addresses {
                 let symbol_index = indirect_symbol_table[it.reserved1 as usize + i as usize];
                 let (symbol_name, _) = mach.symbols().nth(symbol_index as usize).unwrap().unwrap();
@@ -156,7 +130,7 @@ impl MachOFile {
                     .unwrap();
                 let trampoline_address =
                     loaded_lib.base_address + (function_index * INSTRUCTION_SIZE) as u64;
-                emu.mem_write(address, &trampoline_address.to_le_bytes())
+                emu.mem_write(base_address + address, &trampoline_address.to_le_bytes())
                     .unwrap();
                 debug!(
                     "Resolved symbol name={}, resolution_addr={:#x}, trampoline_addr={:#x}",
@@ -181,6 +155,44 @@ impl MachOFile {
     // TODO Implement drop to free memory from emulator
 }
 
+fn load_host_library(
+    host_lib: &HostDynamicLibrary,
+    allocator: &mut Allocator,
+    emu: &mut Unicorn<'_, ()>,
+) -> LoadedLibrary {
+    let global_variables_size = host_lib
+        .global_variables
+        .iter()
+        .map(|it| it.data.len())
+        .sum::<usize>();
+    let functions_size = (host_lib.function_handlers.len() as usize) * INSTRUCTION_SIZE;
+    let size = global_variables_size + functions_size;
+
+    let base_addr = allocator
+        .alloc_mapped(emu, size as u64, Prot::ALL) // TODO Optimize permissions
+        .unwrap();
+    let num_functions = host_lib.function_handlers.len();
+
+    // Write functions
+    for i in 0..num_functions {
+        emu.mem_write(base_addr + (i * INSTRUCTION_SIZE) as u64, &SVC_OPCODE)
+            .unwrap();
+    }
+
+    // Write global variables
+    let mut base_variables = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
+    for it in host_lib.global_variables.iter() {
+        emu.mem_write(base_variables, &it.data)
+            .unwrap();
+        base_variables += it.data.len() as u64;
+    }
+
+    return LoadedLibrary {
+        base_address: base_addr,
+        path: host_lib.path.clone(),
+    };
+}
+
 fn extract_mach<'a>(object: &'a Object<'a>) -> Option<&'a MachO<'a>> {
     let Object::Mach(mach_container) = object else {
         error!("Not a mach binary");
@@ -194,7 +206,12 @@ fn extract_mach<'a>(object: &'a Object<'a>) -> Option<&'a MachO<'a>> {
     todo!("Not a single-arch mach binary, implement fat binaries");
 }
 
-fn map_segments(segments: Vec<&Segment<'_>>, buffer: &[u8], emu: &mut Unicorn<'_, ()>) {
+fn map_segments(
+    segments: Vec<&Segment<'_>>,
+    buffer: &[u8],
+    emu: &mut Unicorn<'_, ()>,
+    base_address: u64,
+) {
     segments.iter().for_each(|it| {
         let prot = map_mach_prot(it.initprot);
         info!(
@@ -209,7 +226,7 @@ fn map_segments(segments: Vec<&Segment<'_>>, buffer: &[u8], emu: &mut Unicorn<'_
 
         if it.filesize > 0 {
             let data = &buffer[it.fileoff as usize..(it.fileoff + it.filesize) as usize];
-            emu.mem_write(it.vmaddr, data).unwrap();
+            emu.mem_write(base_address + it.vmaddr, data).unwrap();
             info!(
                 "Copied {:#x} bytes from file at {:#x} to {:#x}",
                 data.len(),
