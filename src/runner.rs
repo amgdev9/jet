@@ -1,4 +1,4 @@
-use log::info;
+use log::{error, info};
 use unicorn_engine::{Arch, Mode, Prot, RegisterARM64, Unicorn};
 
 use crate::{
@@ -38,13 +38,20 @@ impl Runner {
         emu.reg_write(RegisterARM64::LR, exit_function).unwrap();
 
         // Load executable file
-        let program = MachOFile::load(
+        let mut macho_files = Vec::new();
+        MachOFile::load_into(
             self.path.clone(),
             &mut emu,
             &mut allocator,
             &self.host_dynamic_libraries,
+            &mut macho_files,
         );
-
+        let program = macho_files.iter().find(|it| it.path == self.path).unwrap();
+        let Some(entrypoint) = program.entrypoint else {
+            error!("Program is not executable");
+            return;
+        };
+            
         emu.add_intr_hook(move |emu, interrupt| {
             if interrupt != SVC_INT_NUMBER {
                 return;
@@ -60,8 +67,7 @@ impl Runner {
             }
 
             // PC -> symbol name
-            let lib = program
-                .loaded_libs
+            let lib = macho_files 
                 .iter()
                 .find(|lib| {
                     let base_addr = lib.base_address;
@@ -88,7 +94,6 @@ impl Runner {
         })
         .unwrap();
 
-        let entrypoint = program.entrypoint.expect("Program is not executable");
         info!("Running program at {:#x}...", entrypoint);
         emu.emu_start(entrypoint, STACK_TOP, 0, 0).unwrap();
 

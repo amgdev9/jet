@@ -20,25 +20,28 @@ use crate::{
 
 pub struct MachOFile {
     pub entrypoint: Option<u64>,
-    pub loaded_libs: Vec<LoadedLibrary>,
+    pub path: String,
+    pub base_address: u64,
+    pub export_symbols: Vec<ExportSymbol>,
 }
 
-pub struct LoadedLibrary {
-    pub base_address: u64,
-    pub path: String,
+pub struct ExportSymbol {
+    pub name: String,
+    pub address: u64,
 }
 
 impl MachOFile {
-    pub fn load(
+    pub fn load_into(
         path: String,
         emu: &mut Unicorn<'_, ()>,
         allocator: &mut Allocator,
         host_libs: &Vec<HostDynamicLibrary>,
-    ) -> Self {
+        container: &mut Vec<Self>,
+    ) {
         // Load file
         info!("Loading Mach-O file: {}", path);
-        let path = Path::new(&path);
-        let buffer = fs::read(path).unwrap();
+        let path_obj = Path::new(&path);
+        let buffer = fs::read(path_obj).unwrap();
         let object = Object::parse(&buffer).unwrap();
         let mach = extract_mach(&object).unwrap();
 
@@ -82,26 +85,30 @@ impl MachOFile {
         let indirect_symbol_table = get_indirect_symbol_table(&mach.load_commands, &buffer);
 
         // Load libraries
-        let loaded_libs = mach
-            .libs
+        mach.libs
             .iter()
             .filter(|it| *it != &"self")
             .map(|it| *it)
-            .inspect(|it| {
-                info!("Loading library: {}", it);
-            })
-            .map(|path| {
-                let host_lib = host_libs.iter().find(|it| it.path == *path);
-                if let Some(host_lib) = host_lib {
-                    return load_host_library(host_lib, allocator, emu);
+            .for_each(|lib_path| {
+                if container.iter().any(|it| it.path == *lib_path) {
+                    return;
                 }
+                let host_lib = host_libs.iter().find(|it| it.path == *lib_path);
+                if let Some(host_lib) = host_lib {
+                    let host_lib = load_host_library(host_lib, allocator, emu);
+                    container.push(host_lib);
+                } else {
+                    // Assume @rpath = @loader_path
+                    let current_dir = path_obj.parent().unwrap().to_str().unwrap();
+                    let lib_path = lib_path.replace("@rpath", current_dir);
+                    if lib_path == path {
+                        // Normally libs reference themselves
+                        return;
+                    }
 
-                // TODO Implement loading compiled dynamic libraries
-                // TODO Prevent loading the same library twice
-                error!("Library {} not found", path);
-                std::process::exit(1);
-            })
-            .collect::<Vec<LoadedLibrary>>();
+                    MachOFile::load_into(lib_path, emu, allocator, host_libs, container);
+                }
+            });
 
         // Resolve undefined symbols
         info!("Resolving undefined symbols...");
@@ -112,32 +119,40 @@ impl MachOFile {
                 let (symbol_name, _) = mach.symbols().nth(symbol_index as usize).unwrap().unwrap();
                 let address = it.addr + i * ADDRESS_SIZE as u64;
 
-                let host_lib = host_libs
+                let lib = container
                     .iter()
-                    .find(|it| it.function_handlers.iter().any(|it| it.name == symbol_name));
-                let Some(host_lib) = host_lib else {
+                    .find(|it| it.export_symbols.iter().any(|it| it.name == symbol_name));
+                let Some(lib) = lib else {
                     error!("Symbol {} not found", symbol_name);
                     std::process::exit(1);
                 };
-                let function_index = host_lib
-                    .function_handlers
+                let resolved_address = lib
+                    .export_symbols
                     .iter()
-                    .position(|it| it.name == symbol_name)
-                    .unwrap();
-                let loaded_lib = loaded_libs
-                    .iter()
-                    .find(|it| it.path == host_lib.path)
-                    .unwrap();
-                let trampoline_address =
-                    loaded_lib.base_address + (function_index * INSTRUCTION_SIZE) as u64;
-                emu.mem_write(base_address + address, &trampoline_address.to_le_bytes())
+                    .find(|it| it.name == symbol_name)
+                    .unwrap()
+                    .address;
+                emu.mem_write(base_address + address, &resolved_address.to_le_bytes())
                     .unwrap();
                 debug!(
-                    "Resolved symbol name={}, resolution_addr={:#x}, trampoline_addr={:#x}",
-                    symbol_name, address, trampoline_address
+                    "Resolved symbol name={}, resolution_addr={:#x}, resolved_addr={:#x}",
+                    symbol_name, address, resolved_address
                 );
             }
         });
+
+        // Fetch export symbols
+        let export_symbols = mach
+            .exports()
+            .unwrap()
+            .iter()
+            .map(|it| {
+                return ExportSymbol {
+                    name: it.name.clone(),
+                    address: it.offset + base_address,
+                };
+            })
+            .collect();
 
         // Figure out the entrypoint if file is executable
         let entrypoint = if mach.entry == 0 {
@@ -146,20 +161,21 @@ impl MachOFile {
             Some(mach.entry + base_address)
         };
 
-        Self {
+        container.push(MachOFile {
             entrypoint,
-            loaded_libs,
-        }
+            path,
+            base_address,
+            export_symbols,
+        });
     }
-
-    // TODO Implement drop to free memory from emulator
 }
 
 fn load_host_library(
     host_lib: &HostDynamicLibrary,
     allocator: &mut Allocator,
     emu: &mut Unicorn<'_, ()>,
-) -> LoadedLibrary {
+) -> MachOFile {
+    info!("Loading host library {}...", host_lib.path);
     let global_variables_size = host_lib
         .global_variables
         .iter()
@@ -171,25 +187,36 @@ fn load_host_library(
     let base_addr = allocator
         .alloc_mapped(emu, size as u64, Prot::ALL) // TODO Optimize permissions
         .unwrap();
-    let num_functions = host_lib.function_handlers.len();
+
+    let mut export_symbols: Vec<ExportSymbol> = vec![];
 
     // Write functions
-    for i in 0..num_functions {
-        emu.mem_write(base_addr + (i * INSTRUCTION_SIZE) as u64, &SVC_OPCODE)
-            .unwrap();
+    for (i, handler) in host_lib.function_handlers.iter().enumerate() {
+        let address = base_addr + (i * INSTRUCTION_SIZE) as u64;
+        emu.mem_write(address, &SVC_OPCODE).unwrap();
+        export_symbols.push(ExportSymbol {
+            name: handler.name.clone(),
+            address,
+        });
     }
 
     // Write global variables
+    let num_functions = host_lib.function_handlers.len();
     let mut base_variables = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
     for it in host_lib.global_variables.iter() {
-        emu.mem_write(base_variables, &it.data)
-            .unwrap();
+        emu.mem_write(base_variables, &it.data).unwrap();
+        export_symbols.push(ExportSymbol {
+            name: it.name.clone(),
+            address: base_variables,
+        });
         base_variables += it.data.len() as u64;
     }
 
-    return LoadedLibrary {
+    return MachOFile {
+        entrypoint: None,
         base_address: base_addr,
         path: host_lib.path.clone(),
+        export_symbols,
     };
 }
 
@@ -222,7 +249,8 @@ fn map_segments(
             prot.0
         );
 
-        emu.mem_map(it.vmaddr, it.vmsize, prot).unwrap();
+        emu.mem_map(base_address + it.vmaddr, it.vmsize, prot)
+            .unwrap();
 
         if it.filesize > 0 {
             let data = &buffer[it.fileoff as usize..(it.fileoff + it.filesize) as usize];
