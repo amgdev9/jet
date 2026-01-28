@@ -7,9 +7,9 @@ This is a PoC of trying to run Mach-O executables for different CPU architecture
 - ✅ Provide dynamic libraries which run on the host
 - ✅ Load regular dynamic libraries required by the executable (resolved recursively)
     (*) needs polishing when resolving runtime search paths
+- ✅ Call from host function to emulated function (via a function pointer), preserving program flow
 
 ## What's work in progress
-- 🚧 Provide a mechanism to implement host-powered reentrant functions (e.g. functions which receive a callback which itself may call to host again, even to the same function) 
 - 🚧 Provide a threading solution using host threads (e.g. instantiating an emulator per thread sharing mapped memory)
 
 ## Future goals

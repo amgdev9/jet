@@ -4,7 +4,7 @@ use unicorn_engine::{Arch, Mode, Prot, RegisterARM64, Unicorn};
 use crate::{
     allocator::Allocator,
     arch::{INSTRUCTION_SIZE, SVC_INT_NUMBER, SVC_OPCODE},
-    host_dynamic_library::HostDynamicLibrary,
+    host_dynamic_library::{FunctionHandler, HostDynamicLibrary},
     mach::MachOFile,
 };
 
@@ -51,14 +51,13 @@ impl Runner {
             error!("Program is not executable");
             return;
         };
-            
+
         emu.add_intr_hook(move |emu, interrupt| {
             if interrupt != SVC_INT_NUMBER {
                 return;
             }
 
             let pc = emu.reg_read(RegisterARM64::PC).unwrap() - INSTRUCTION_SIZE as u64; // PC is already incremented
-            let return_addr = emu.reg_read(RegisterARM64::LR).unwrap();
 
             // Check program exit
             if pc == exit_function {
@@ -66,31 +65,49 @@ impl Runner {
                 return;
             }
 
-            // PC -> symbol name
-            let lib = macho_files 
-                .iter()
-                .find(|lib| {
-                    let base_addr = lib.base_address;
-                    let host_lib = self
-                        .host_dynamic_libraries
+            // Match PC with function handler from a host library
+            let mut handler: Option<&FunctionHandler> = None;
+            let mut num_continuation: Option<u32> = None;
+            for lib in macho_files.iter() {
+                if handler.is_some() {
+                    break;
+                }
+                let host_lib = self
+                    .host_dynamic_libraries
+                    .iter()
+                    .find(|it| it.path == lib.path);
+                let Some(host_lib) = host_lib else {
+                    continue;
+                };
+                for symbol in lib.export_symbols.iter() {
+                    let possible_handler = host_lib
+                        .function_handlers
                         .iter()
-                        .find(|it| it.path == lib.path)
+                        .find(|it| it.name == symbol.name)
                         .unwrap();
-                    let num_functions = host_lib.function_handlers.len();
-                    let end_addr = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
-                    return pc >= base_addr && pc < end_addr;
-                })
-                .expect("Symbol at PC={:#x} not found");
-            let host_library = self
-                .host_dynamic_libraries
-                .iter()
-                .find(|it| it.path == lib.path)
-                .unwrap();
-            let function_index = (pc - lib.base_address) / INSTRUCTION_SIZE as u64;
-            let handler = &host_library.function_handlers[function_index as usize];
-            (handler.handler)(emu);
+                    let fun_start = symbol.address;
+                    let fun_end = fun_start
+                        + (possible_handler.num_continuations * INSTRUCTION_SIZE as u32) as u64;
+                    if pc >= fun_start && pc < fun_end {
+                        num_continuation =
+                            Some(((pc - fun_start) / (INSTRUCTION_SIZE as u64)) as u32);
+                        handler = Some(possible_handler);
+                        break;
+                    }
+                }
+            }
 
-            emu.reg_write(RegisterARM64::PC, return_addr).unwrap();
+            let Some(handler) = handler else {
+                error!("Symbol at PC={:#x} not found", pc);
+                std::process::exit(1);
+            };
+            let num_continuation = num_continuation.unwrap();
+            (handler.handler)(emu, num_continuation);
+
+            if num_continuation == handler.num_continuations - 1 {
+                let return_addr = emu.reg_read(RegisterARM64::LR).unwrap();
+                emu.reg_write(RegisterARM64::PC, return_addr).unwrap();
+            }
         })
         .unwrap();
 

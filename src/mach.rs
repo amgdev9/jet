@@ -191,9 +191,13 @@ fn load_host_library(
     let mut export_symbols: Vec<ExportSymbol> = vec![];
 
     // Write functions
-    for (i, handler) in host_lib.function_handlers.iter().enumerate() {
-        let address = base_addr + (i * INSTRUCTION_SIZE) as u64;
-        emu.mem_write(address, &SVC_OPCODE).unwrap();
+    let mut fun_address = base_addr;
+    for handler in host_lib.function_handlers.iter() {
+        let address = fun_address;
+        for _ in 0..handler.num_continuations {
+            emu.mem_write(fun_address, &SVC_OPCODE).unwrap();
+            fun_address += INSTRUCTION_SIZE as u64;
+        }
         export_symbols.push(ExportSymbol {
             name: handler.name.clone(),
             address,
@@ -201,8 +205,7 @@ fn load_host_library(
     }
 
     // Write global variables
-    let num_functions = host_lib.function_handlers.len();
-    let mut base_variables = base_addr + (num_functions * INSTRUCTION_SIZE) as u64;
+    let mut base_variables = fun_address;
     for it in host_lib.global_variables.iter() {
         emu.mem_write(base_variables, &it.data).unwrap();
         export_symbols.push(ExportSymbol {
