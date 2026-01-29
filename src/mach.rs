@@ -13,7 +13,7 @@ use log::{debug, error, info};
 use unicorn_engine::{Prot, Unicorn};
 
 use crate::{
-    allocator::{Allocation, Allocator},
+    allocator::{Allocation, Allocator, MemoryMapping},
     arch::{ADDRESS_SIZE, INSTRUCTION_SIZE, SVC_OPCODE},
     host_dynamic_library::HostDynamicLibrary,
 };
@@ -48,21 +48,13 @@ impl MachOFile {
         // Map segments to emulator
         let segments: Vec<&Segment<'_>> =
             mach.segments.iter().filter(|it| it.initprot != 0).collect();
-        let start_addr = segments.iter().map(|it| it.vmaddr).min().unwrap();
-        let end_addr = segments
-            .iter()
-            .map(|it| it.vmaddr + it.vmsize)
-            .max()
-            .unwrap();
-        let total_size = end_addr - start_addr;
-        let allocation = allocator.alloc_unmapped(total_size).unwrap();
+        let allocation = map_segments(&segments, &buffer, emu, allocator);
         let base_address = allocation.address;
-        map_segments(segments, &buffer, emu, &allocation, start_addr);
+        let start_addr = segments.iter().map(|it| it.vmaddr).min().unwrap();
 
         // Fetch sections with unresolved symbols
         info!("Fetching sections with unresolved symbols...");
-        let sections_with_unresolved_symbols: Vec<Section> = mach
-            .segments
+        let sections_with_unresolved_symbols: Vec<Section> = segments
             .iter()
             .flat_map(|it| it.sections().unwrap())
             .filter(|(it, _)| {
@@ -133,8 +125,11 @@ impl MachOFile {
                     .find(|it| it.name == symbol_name)
                     .unwrap()
                     .address;
-                emu.mem_write(base_address + address - start_addr, &resolved_address.to_le_bytes())
-                    .unwrap();
+                emu.mem_write(
+                    base_address + address - start_addr,
+                    &resolved_address.to_le_bytes(),
+                )
+                .unwrap();
                 debug!(
                     "Resolved symbol name={}, resolution_addr={:#x}, resolved_addr={:#x}",
                     symbol_name, address, resolved_address
@@ -186,7 +181,7 @@ fn load_host_library(
     let size = global_variables_size + functions_size;
 
     let allocation = allocator
-        .alloc_mapped(emu, size as u64, Prot::ALL) // TODO Optimize permissions
+        .simple_alloc(emu, size as u64, Prot::ALL) // TODO Optimize permissions
         .unwrap();
     let base_addr = allocation.address;
 
@@ -239,41 +234,52 @@ fn extract_mach<'a>(object: &'a Object<'a>) -> Option<&'a MachO<'a>> {
 }
 
 fn map_segments(
-    segments: Vec<&Segment<'_>>,
+    segments: &Vec<&Segment<'_>>,
     buffer: &[u8],
     emu: &mut Unicorn<'_, ()>,
-    allocation: &Allocation,
-    start_address: u64,
-) {
-    let base_address = allocation.address;
-    info!("base_address={:#x} size={:#x}", base_address, allocation.size);
-    segments.iter().for_each(|it| {
-        let prot = map_mach_prot(it.initprot);
-        info!(
-            "Segment: name={} start_addr={:#x} vm_size={:#x} prot={:#b}",
-            it.name().unwrap(),
-            it.vmaddr,
-            it.vmsize,
-            prot.0
-        );
+    allocator: &mut Allocator,
+) -> Allocation {
+    let start_addr = segments.iter().map(|it| it.vmaddr).min().unwrap();
+    let end_addr = segments
+        .iter()
+        .map(|it| it.vmaddr + it.vmsize)
+        .max()
+        .unwrap();
+    let total_size = end_addr - start_addr;
 
-        unsafe {
-            let ptr = allocation.host_address.as_ptr().add((it.vmaddr - start_address) as usize);
-            emu.mem_map_ptr(base_address + it.vmaddr - start_address, it.vmsize, prot, ptr as *mut _)
-                .unwrap();
-        }
-
-        if it.filesize > 0 {
-            let data = &buffer[it.fileoff as usize..(it.fileoff + it.filesize) as usize];
-            emu.mem_write(base_address + it.vmaddr - start_address, data).unwrap();
+    let mappings = segments
+        .iter()
+        .inspect(|it| {
             info!(
-                "Copied {:#x} bytes from file at {:#x} to {:#x}",
-                data.len(),
-                it.fileoff,
-                it.vmaddr
+                "Segment: name={} start_addr={:#x} vm_size={:#x} prot={:#b}",
+                it.name().unwrap(),
+                it.vmaddr,
+                it.vmsize,
+                it.initprot
             );
-        }
+        })
+        .map(|it| MemoryMapping {
+            offset: it.vmaddr - start_addr,
+            size: it.vmsize,
+            prot: map_mach_prot(it.initprot),
+        })
+        .collect::<Vec<_>>();
+
+    let allocation = allocator.alloc(emu, total_size, mappings).unwrap();
+
+    segments.iter().filter(|it| it.filesize > 0).for_each(|it| {
+        let data = &buffer[it.fileoff as usize..(it.fileoff + it.filesize) as usize];
+        let address = allocation.address + it.vmaddr - start_addr;
+        emu.mem_write(address, data).unwrap();
+        info!(
+            "Copied {:#x} bytes from file at {:#x} to {:#x}",
+            data.len(),
+            it.fileoff,
+            it.vmaddr
+        );
     });
+
+    allocation
 }
 
 fn map_mach_prot(prot: u32) -> Prot {
