@@ -31,9 +31,10 @@ impl Runner {
         setup_stack(&mut emu, &args, &env);
 
         // Setup program exit call
-        let exit_function = allocator
+        let exit_function_alloc = allocator
             .alloc_mapped(&mut emu, size_of::<u32>() as u64, Prot::READ | Prot::EXEC)
             .unwrap();
+        let exit_function = exit_function_alloc.address;
         emu.mem_write(exit_function, &SVC_OPCODE).unwrap();
         emu.reg_write(RegisterARM64::LR, exit_function).unwrap();
 
