@@ -2,6 +2,7 @@ use std::{
     alloc::{Layout, alloc, dealloc},
     ops::Range,
     ptr::NonNull,
+    u64,
 };
 
 use log::warn;
@@ -29,9 +30,12 @@ pub struct MemoryMapping {
 }
 
 impl Allocator {
-    pub fn new(start: u64, end: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            alloc_impl: RangeAllocator::new(Range { start, end }),
+            alloc_impl: RangeAllocator::new(Range {
+                start: 0,
+                end: u64::MAX,
+            }),
             allocations: Vec::new(),
         }
     }
@@ -62,6 +66,9 @@ impl Allocator {
         size: u64,
         mappings: Vec<MemoryMapping>,
     ) -> Option<Allocation> {
+        // Align to 4KB pages
+        let size = (size + 0xFFF) & !0xFFF;
+
         let start_addr = self.alloc_impl.allocate_range(size).ok().map(|it| it.start);
         let Some(start_addr) = start_addr else {
             return None;

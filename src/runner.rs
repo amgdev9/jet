@@ -8,9 +8,7 @@ use crate::{
     mach::MachOFile,
 };
 
-const STACK_SIZE: u64 = 8 << 20; // Not growable
-const STACK_TOP: u64 = 0x7fff_ffff_ffff;
-const STACK_BASE: u64 = STACK_TOP - STACK_SIZE + 1;
+const STACK_SIZE: u64 = 8 << 20; // Fixed size 
 
 pub struct Runner {
     path: String,
@@ -27,12 +25,12 @@ impl Runner {
 
     pub fn run(&self, args: Vec<String>, env: Vec<String>) {
         let mut emu = Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN).unwrap();
-        let mut allocator = Allocator::new(0, STACK_BASE);
-        setup_stack(&mut emu, &args, &env);
+        let mut allocator = Allocator::new();
+        setup_stack(&mut emu, &mut allocator, &args, &env);
 
         // Setup program exit call
         let exit_function_alloc = allocator
-            .simple_alloc(&mut emu, size_of::<u32>() as u64, Prot::READ | Prot::EXEC)
+            .simple_alloc(&mut emu, INSTRUCTION_SIZE as u64, Prot::READ | Prot::EXEC)
             .unwrap();
         let exit_function = exit_function_alloc.address;
         emu.mem_write(exit_function, &SVC_OPCODE).unwrap();
@@ -113,16 +111,26 @@ impl Runner {
         .unwrap();
 
         info!("Running program at {:#x}...", entrypoint);
-        emu.emu_start(entrypoint, STACK_TOP, 0, 0).unwrap();
+        emu.emu_start(entrypoint, u64::MAX, 0, 0).unwrap();
 
         info!("Program finished!");
     }
 }
 
-fn setup_stack(emu: &mut Unicorn<'_, ()>, args: &Vec<String>, env: &Vec<String>) {
-    info!("Stack: Base: {:#x} Size: {:#x}", STACK_BASE, STACK_SIZE);
-    emu.mem_map(STACK_BASE as u64, STACK_SIZE, Prot::READ | Prot::WRITE)
+fn setup_stack(
+    emu: &mut Unicorn<'_, ()>,
+    allocator: &mut Allocator,
+    args: &Vec<String>,
+    env: &Vec<String>,
+) {
+    let allocation = allocator
+        .simple_alloc(emu, STACK_SIZE, Prot::READ | Prot::WRITE)
         .unwrap();
+    let stack_top = allocation.address + allocation.size - 1;
+    info!(
+        "Stack: Base: {:#x} Size: {:#x} Top: {:#x}",
+        allocation.address, STACK_SIZE, stack_top
+    );
 
     let argc = args.len() as u64;
     emu.reg_write(RegisterARM64::X0, argc).unwrap();
@@ -136,7 +144,7 @@ fn setup_stack(emu: &mut Unicorn<'_, ()>, args: &Vec<String>, env: &Vec<String>)
 
     let total_size = strings_size + ptrs_size;
 
-    let sp = STACK_TOP - total_size as u64;
+    let sp = stack_top - total_size as u64;
     emu.reg_write(RegisterARM64::SP, sp).unwrap();
 
     let argv_base = sp;
