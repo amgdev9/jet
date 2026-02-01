@@ -1,5 +1,11 @@
+use std::{
+    cell::{RefCell, RefMut},
+    rc::Rc,
+    u64,
+};
+
 use log::{error, info};
-use unicorn_engine::{Arch, Mode, Prot, RegisterARM64, Unicorn};
+use unicorn_engine::{Arch, HookType, Mode, Prot, RegisterARM64, Unicorn};
 
 use crate::{
     allocator::Allocator,
@@ -11,46 +17,104 @@ use crate::{
 const STACK_SIZE: u64 = 8 << 20; // Fixed size 
 
 pub struct Runner {
-    path: String,
-    host_dynamic_libraries: Vec<HostDynamicLibrary>,
+    host_dynamic_libraries: Rc<Vec<HostDynamicLibrary>>,
+    macho_files: Rc<RefCell<Vec<MachOFile>>>,
+    allocator: Rc<RefCell<Allocator>>,
+    exit_function_address: Rc<RefCell<Option<u64>>>,
 }
 
 impl Runner {
-    pub fn new(path: String, host_dynamic_libraries: Vec<HostDynamicLibrary>) -> Self {
+    pub fn new(host_dynamic_libraries: Vec<HostDynamicLibrary>) -> Self {
         Self {
-            path,
-            host_dynamic_libraries,
+            host_dynamic_libraries: Rc::new(host_dynamic_libraries),
+            macho_files: Rc::new(RefCell::new(Vec::new())),
+            allocator: Rc::new(RefCell::new(Allocator::new())),
+            exit_function_address: Rc::new(RefCell::new(None)),
         }
     }
 
-    pub fn run(&self, args: Vec<String>, env: Vec<String>) {
-        let mut emu = Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN).unwrap();
-        let mut allocator = Allocator::new();
-        setup_stack(&mut emu, &mut allocator, &args, &env);
+    pub fn run(&mut self, path: String, args: Vec<String>, env: Vec<String>) {
+        let mut emu = self.new_emulator();
+        push_arguments(&mut emu, &args, &env);
 
         // Setup program exit call
-        let exit_function_alloc = allocator
+        let exit_function_alloc = self
+            .allocator
+            .borrow_mut()
             .simple_alloc(&mut emu, INSTRUCTION_SIZE as u64, Prot::READ | Prot::EXEC)
             .unwrap();
         let exit_function = exit_function_alloc.address;
         emu.mem_write(exit_function, &SVC_OPCODE).unwrap();
         emu.reg_write(RegisterARM64::LR, exit_function).unwrap();
+        self.exit_function_address
+            .borrow_mut()
+            .replace(exit_function);
 
         // Load executable file
-        let mut macho_files = Vec::new();
-        MachOFile::load_into(
-            self.path.clone(),
-            &mut emu,
-            &mut allocator,
-            &self.host_dynamic_libraries,
-            &mut macho_files,
-        );
-        let program = macho_files.iter().find(|it| it.path == self.path).unwrap();
-        let Some(entrypoint) = program.entrypoint else {
+        {
+            let mut macho_files = self.macho_files.borrow_mut();
+            let mut allocator = self.allocator.borrow_mut();
+            MachOFile::load_into(
+                path.clone(),
+                &mut emu,
+                &mut allocator,
+                &self.host_dynamic_libraries,
+                &mut macho_files,
+            );
+        }
+
+        // Figure out entrypoint
+        let entrypoint = self
+            .macho_files
+            .borrow()
+            .iter()
+            .find(|it| it.path == path)
+            .unwrap()
+            .entrypoint;
+        let Some(entrypoint) = entrypoint else {
             error!("Program is not executable");
             return;
         };
 
+        info!("Running program at {:#x}...", entrypoint);
+        self.start_emulator(&mut emu, entrypoint);
+
+        info!("Program finished!");
+    }
+
+    pub fn allocator(&self) -> RefMut<'_, Allocator> {
+        self.allocator.borrow_mut()
+    }
+
+    pub fn new_thread(&mut self, entrypoint: u64) {
+        let mut emu = self.new_emulator();
+
+        info!("Starting new thread at {:#x}...", entrypoint);
+        self.start_emulator(&mut emu, entrypoint);
+
+        info!("Thread finished!");
+    }
+
+    fn new_emulator<'a>(&mut self) -> Unicorn<'a, ()> {
+        let mut emu = Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN).unwrap();
+
+        // Setup stack
+        let allocation = self
+            .allocator
+            .borrow_mut()
+            .simple_alloc(&mut emu, STACK_SIZE, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let stack_top = allocation.address + allocation.size - 1;
+        info!(
+            "Stack: Base: {:#x} Size: {:#x} Top: {:#x}",
+            allocation.address, STACK_SIZE, stack_top
+        );
+        emu.reg_write(RegisterARM64::SP, stack_top).unwrap();
+
+        // Setup syscall handler (used to call host functions)
+        let exit_function_address = self.exit_function_address.clone();
+        let macho_files = self.macho_files.clone();
+        let host_dynamic_libraries = self.host_dynamic_libraries.clone();
         emu.add_intr_hook(move |emu, interrupt| {
             if interrupt != SVC_INT_NUMBER {
                 return;
@@ -59,7 +123,7 @@ impl Runner {
             let pc = emu.reg_read(RegisterARM64::PC).unwrap() - INSTRUCTION_SIZE as u64; // PC is already incremented
 
             // Check program exit
-            if pc == exit_function {
+            if pc == exit_function_address.borrow().unwrap() {
                 emu.emu_stop().unwrap();
                 return;
             }
@@ -67,14 +131,11 @@ impl Runner {
             // Match PC with function handler from a host library
             let mut handler: Option<&FunctionHandler> = None;
             let mut num_continuation: Option<u32> = None;
-            for lib in macho_files.iter() {
+            for lib in macho_files.borrow().iter() {
                 if handler.is_some() {
                     break;
                 }
-                let host_lib = self
-                    .host_dynamic_libraries
-                    .iter()
-                    .find(|it| it.path == lib.path);
+                let host_lib = host_dynamic_libraries.iter().find(|it| it.path == lib.path);
                 let Some(host_lib) = host_lib else {
                     continue;
                 };
@@ -101,37 +162,38 @@ impl Runner {
                 std::process::exit(1);
             };
             let num_continuation = num_continuation.unwrap();
+            let num_continuations = handler.num_continuations;
             (handler.handler)(emu, num_continuation);
 
-            if num_continuation == handler.num_continuations - 1 {
+            if num_continuation == num_continuations - 1 {
                 let return_addr = emu.reg_read(RegisterARM64::LR).unwrap();
                 emu.reg_write(RegisterARM64::PC, return_addr).unwrap();
             }
         })
         .unwrap();
 
-        info!("Running program at {:#x}...", entrypoint);
-        emu.emu_start(entrypoint, u64::MAX, 0, 0).unwrap();
+        // Setup page fault handler
+        let allocator = self.allocator.clone();
+        emu.add_mem_hook(
+            HookType::MEM_INVALID,
+            0,
+            u64::MAX,
+            move |emu, _access, addr, _size, _value| {
+                allocator.borrow_mut().page_fault_handler(emu, addr)
+            },
+        )
+        .unwrap();
 
-        info!("Program finished!");
+        emu
+    }
+
+    fn start_emulator(&mut self, emu: &mut Unicorn<'_, ()>, entrypoint: u64) {
+        emu.emu_start(entrypoint, u64::MAX, 0, 0).unwrap();
+        self.allocator.borrow_mut().garbage_collect_thread(emu);
     }
 }
 
-fn setup_stack(
-    emu: &mut Unicorn<'_, ()>,
-    allocator: &mut Allocator,
-    args: &Vec<String>,
-    env: &Vec<String>,
-) {
-    let allocation = allocator
-        .simple_alloc(emu, STACK_SIZE, Prot::READ | Prot::WRITE)
-        .unwrap();
-    let stack_top = allocation.address + allocation.size - 1;
-    info!(
-        "Stack: Base: {:#x} Size: {:#x} Top: {:#x}",
-        allocation.address, STACK_SIZE, stack_top
-    );
-
+fn push_arguments(emu: &mut Unicorn<'_, ()>, args: &Vec<String>, env: &Vec<String>) {
     let argc = args.len() as u64;
     emu.reg_write(RegisterARM64::X0, argc).unwrap();
 
@@ -144,7 +206,8 @@ fn setup_stack(
 
     let total_size = strings_size + ptrs_size;
 
-    let sp = stack_top - total_size as u64;
+    let mut sp = emu.reg_read(RegisterARM64::SP).unwrap();
+    sp -= total_size as u64;
     emu.reg_write(RegisterARM64::SP, sp).unwrap();
 
     let argv_base = sp;

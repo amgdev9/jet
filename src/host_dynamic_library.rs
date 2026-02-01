@@ -18,7 +18,7 @@ pub struct FunctionHandler {
                 0 => {
                     // ... handler code ...
                     // When you need to call the function pointer do as follows:
-                    // - Push registers to the stack (the ones which will get overwritten for the callback function call) 
+                    // - Push registers to the stack (the ones which will get overwritten for the callback function call)
                     // - Push LR to the stack
                     // - Set registers for callback function arguments
                     // - Jump to callback function (PC = function pointer)

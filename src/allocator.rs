@@ -66,9 +66,9 @@ impl Allocator {
         }
     }
 
-    pub fn simple_alloc(
+    pub fn simple_alloc<'a>(
         &mut self,
-        emu: &mut Unicorn<'_, ()>,
+        emu: &mut Unicorn<'a, ()>,
         size: u64,
         prot: Prot,
     ) -> Option<Allocation> {
@@ -86,9 +86,9 @@ impl Allocator {
         )
     }
 
-    pub fn alloc(
+    pub fn alloc<'a>(
         &mut self,
-        emu: &mut Unicorn<'_, ()>,
+        emu: &mut Unicorn<'a, ()>,
         size: u64,
         mappings: Vec<MemoryMapping>,
     ) -> Option<Allocation> {
@@ -120,7 +120,7 @@ impl Allocator {
         Some(allocation)
     }
 
-    pub fn free(&mut self, emu: &mut Unicorn<'_, ()>, allocation: &Allocation) {
+    pub fn free<'a>(&mut self, emu: &mut Unicorn<'a, ()>, allocation: &Allocation) {
         let allocation = self
             .allocations
             .iter_mut()
@@ -135,7 +135,7 @@ impl Allocator {
         self.garbage_collect_thread(emu);
     }
 
-    pub fn page_fault_handler(&mut self, emu: &mut Unicorn<'_, ()>, addr: u64) -> bool {
+    pub fn page_fault_handler<'a>(&mut self, emu: &mut Unicorn<'a, ()>, addr: u64) -> bool {
         let thread_id = thread::current().id();
         let allocation = self
             .allocations
@@ -152,8 +152,8 @@ impl Allocator {
     }
 
     // Used to reclaim freed memory used by the current thread
-    // Recommended to call this on thread exit to ensure memory leaks on the emulated program are freed
-    pub fn garbage_collect_thread(&mut self, emu: &mut Unicorn<'_, ()>) {
+    // Recommended to call this on thread exit to ensure memory is not leaked
+    pub fn garbage_collect_thread<'a>(&mut self, emu: &mut Unicorn<'a, ()>) {
         let thread_id = thread::current().id();
 
         let mut mapped_freed_allocations = self
