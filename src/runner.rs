@@ -35,7 +35,6 @@ impl Runner {
 
     pub fn run(&mut self, path: String, args: Vec<String>, env: Vec<String>) {
         let mut emu = self.new_emulator();
-        push_arguments(&mut emu, &args, &env);
 
         // Setup program exit call
         let exit_function_alloc = self
@@ -78,6 +77,7 @@ impl Runner {
         };
 
         info!("Running program at {:#x}...", entrypoint);
+        push_arguments(&mut emu, &args, &env);  // TODO Move to crt0
         self.start_emulator(&mut emu, entrypoint);
 
         info!("Program finished!");
