@@ -1,7 +1,7 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::RefCell,
     rc::Rc,
-    u64,
+    sync::{Arc, Mutex},
 };
 
 use log::{error, info};
@@ -19,7 +19,7 @@ const STACK_SIZE: u64 = 8 << 20; // Fixed size
 pub struct Runner {
     host_dynamic_libraries: Rc<Vec<HostDynamicLibrary>>,
     macho_files: Rc<RefCell<Vec<MachOFile>>>,
-    allocator: Rc<RefCell<Allocator>>,
+    allocator: Arc<Mutex<Allocator>>,
     exit_function_address: Rc<RefCell<Option<u64>>>,
 }
 
@@ -28,7 +28,7 @@ impl Runner {
         Self {
             host_dynamic_libraries: Rc::new(host_dynamic_libraries),
             macho_files: Rc::new(RefCell::new(Vec::new())),
-            allocator: Rc::new(RefCell::new(Allocator::new())),
+            allocator: Arc::new(Mutex::new(Allocator::new())),
             exit_function_address: Rc::new(RefCell::new(None)),
         }
     }
@@ -40,7 +40,8 @@ impl Runner {
         // Setup program exit call
         let exit_function_alloc = self
             .allocator
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .simple_alloc(&mut emu, INSTRUCTION_SIZE as u64, Prot::READ | Prot::EXEC)
             .unwrap();
         let exit_function = exit_function_alloc.address;
@@ -53,7 +54,7 @@ impl Runner {
         // Load executable file
         {
             let mut macho_files = self.macho_files.borrow_mut();
-            let mut allocator = self.allocator.borrow_mut();
+            let mut allocator = self.allocator.lock().unwrap(); // TODO Lock on usage inside MachOFile::load_into
             MachOFile::load_into(
                 path.clone(),
                 &mut emu,
@@ -82,8 +83,8 @@ impl Runner {
         info!("Program finished!");
     }
 
-    pub fn allocator(&self) -> RefMut<'_, Allocator> {
-        self.allocator.borrow_mut()
+    pub fn allocator(&self) -> Arc<Mutex<Allocator>> {
+        self.allocator.clone()
     }
 
     pub fn new_thread(&mut self, entrypoint: u64) {
@@ -101,7 +102,8 @@ impl Runner {
         // Setup stack
         let allocation = self
             .allocator
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .simple_alloc(&mut emu, STACK_SIZE, Prot::READ | Prot::WRITE)
             .unwrap();
         let stack_top = allocation.address + allocation.size - 1;
@@ -179,7 +181,7 @@ impl Runner {
             0,
             u64::MAX,
             move |emu, _access, addr, _size, _value| {
-                allocator.borrow_mut().page_fault_handler(emu, addr)
+                allocator.lock().unwrap().page_fault_handler(emu, addr)
             },
         )
         .unwrap();
@@ -189,7 +191,7 @@ impl Runner {
 
     fn start_emulator(&mut self, emu: &mut Unicorn<'_, ()>, entrypoint: u64) {
         emu.emu_start(entrypoint, u64::MAX, 0, 0).unwrap();
-        self.allocator.borrow_mut().garbage_collect_thread(emu);
+        self.allocator.lock().unwrap().garbage_collect_thread(emu);
     }
 }
 
