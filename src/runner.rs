@@ -132,7 +132,7 @@ impl Runner {
 
             // Match PC with function handler from a host library
             let mut handler: Option<&FunctionHandler> = None;
-            let mut num_continuation: Option<u32> = None;
+            let mut instruction_offset: Option<u32> = None;
             for lib in macho_files.borrow().iter() {
                 if handler.is_some() {
                     break;
@@ -148,10 +148,9 @@ impl Runner {
                         .find(|it| it.name == symbol.name)
                         .unwrap();
                     let fun_start = symbol.address;
-                    let fun_end = fun_start
-                        + (possible_handler.num_continuations * INSTRUCTION_SIZE as u32) as u64;
+                    let fun_end = fun_start + (possible_handler.entrypoint().len() as u64);
                     if pc >= fun_start && pc < fun_end {
-                        num_continuation =
+                        instruction_offset =
                             Some(((pc - fun_start) / (INSTRUCTION_SIZE as u64)) as u32);
                         handler = Some(possible_handler);
                         break;
@@ -163,14 +162,7 @@ impl Runner {
                 error!("Symbol at PC={:#x} not found", pc);
                 std::process::exit(1);
             };
-            let num_continuation = num_continuation.unwrap();
-            let num_continuations = handler.num_continuations;
-            (handler.handler)(emu, num_continuation);
-
-            if num_continuation == num_continuations - 1 {
-                let return_addr = emu.reg_read(RegisterARM64::LR).unwrap();
-                emu.reg_write(RegisterARM64::PC, return_addr).unwrap();
-            }
+            (handler.syscall_handler)(emu, instruction_offset.unwrap());
         })
         .unwrap();
 

@@ -14,7 +14,7 @@ use unicorn_engine::{Prot, Unicorn};
 
 use crate::{
     allocator::{Allocation, Allocator, MemoryMapping},
-    arch::{ADDRESS_SIZE, INSTRUCTION_SIZE, SVC_OPCODE},
+    arch::ADDRESS_SIZE,
     host_dynamic_library::HostDynamicLibrary,
 };
 
@@ -177,7 +177,11 @@ fn load_host_library(
         .iter()
         .map(|it| it.data.len())
         .sum::<usize>();
-    let functions_size = (host_lib.function_handlers.len() as usize) * INSTRUCTION_SIZE;
+    let functions_size = host_lib
+        .function_handlers
+        .iter()
+        .map(|it| it.entrypoint().len())
+        .sum::<usize>();
     let size = global_variables_size + functions_size;
 
     let allocation = allocator
@@ -190,15 +194,13 @@ fn load_host_library(
     // Write functions
     let mut fun_address = base_addr;
     for handler in host_lib.function_handlers.iter() {
-        let address = fun_address;
-        for _ in 0..handler.num_continuations {
-            emu.mem_write(fun_address, &SVC_OPCODE).unwrap();
-            fun_address += INSTRUCTION_SIZE as u64;
-        }
+        let entrypoint = handler.entrypoint();
+        emu.mem_write(fun_address, entrypoint).unwrap();
         export_symbols.push(ExportSymbol {
             name: handler.name.clone(),
-            address,
+            address: fun_address,
         });
+        fun_address += entrypoint.len() as u64;
     }
 
     // Write global variables
