@@ -33,7 +33,7 @@ impl Runner {
         }
     }
 
-    pub fn run(&mut self, path: String, args: Vec<String>, env: Vec<String>) {
+    pub fn run(&self, path: String, args: Vec<String>, env: Vec<String>) {
         let mut emu = self.new_emulator();
 
         // Setup program exit call
@@ -96,7 +96,7 @@ impl Runner {
         info!("Thread finished!");
     }
 
-    fn new_emulator<'a>(&mut self) -> Unicorn<'a, ()> {
+    fn new_emulator<'a>(&self) -> Unicorn<'a, ()> {
         let mut emu = Unicorn::new(Arch::ARM64, Mode::LITTLE_ENDIAN).unwrap();
 
         // Setup stack
@@ -181,7 +181,7 @@ impl Runner {
         emu
     }
 
-    fn start_emulator(&mut self, emu: &mut Unicorn<'_, ()>, entrypoint: u64) {
+    fn start_emulator(&self, emu: &mut Unicorn<'_, ()>, entrypoint: u64) {
         emu.emu_start(entrypoint, u64::MAX, 0, 0).unwrap();
         self.allocator.lock().unwrap().garbage_collect_thread(emu);
     }
