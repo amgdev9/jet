@@ -1,5 +1,7 @@
 use unicorn_engine::Unicorn;
 
+use crate::emulation_context::EmulationContext;
+
 pub struct HostDynamicLibrary {
     pub path: String,
     pub function_handlers: Vec<FunctionHandler>,
@@ -15,7 +17,7 @@ pub struct FunctionHandler {
 
     /// Syscall handler for this function
     /// Second parameter is the offset inside the entrypoint code, measured in instructions
-    pub syscall_handler: fn(&mut Unicorn<'_, ()>, u32),
+    pub syscall_handler: fn(&mut Unicorn<'_, ()>, u32, &EmulationContext),
 }
 
 impl FunctionHandler {
