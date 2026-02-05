@@ -41,7 +41,7 @@ impl MachOFile {
         // Load file
         info!("Loading Mach-O file: {}", path);
         let path_obj = Path::new(&path);
-        let buffer = fs::read(path_obj).unwrap();
+        let buffer = fs::read(path_obj).expect(format!("Failed to read {}", path).as_str());
         let object = Object::parse(&buffer).unwrap();
         let mach = extract_mach(&object).unwrap();
 

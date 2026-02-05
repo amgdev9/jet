@@ -26,7 +26,7 @@ impl Runner {
 
         // Load executable file
         {
-            let mut macho_files = ctx.macho_files.borrow_mut();
+            let mut macho_files = ctx.macho_files.write().unwrap();
             let mut allocator = ctx.allocator.lock().unwrap(); // TODO Lock on usage inside MachOFile::load_into
             MachOFile::load_into(
                 path.clone(),
@@ -40,7 +40,8 @@ impl Runner {
         // Figure out entrypoint
         let entrypoint = ctx
             .macho_files
-            .borrow()
+            .read()
+            .unwrap()
             .iter()
             .find(|it| it.path == path)
             .unwrap()
@@ -64,7 +65,8 @@ impl Runner {
         emu.mem_write(exit_function, &SVC_OPCODE).unwrap();
         emu.reg_write(RegisterARM64::LR, exit_function).unwrap();
         ctx.exit_function_address
-            .borrow_mut()
+            .write()
+            .unwrap()
             .replace(exit_function);
 
         ctx.start_emulator(&mut emu, entrypoint);

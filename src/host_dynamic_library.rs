@@ -8,6 +8,8 @@ pub struct HostDynamicLibrary {
     pub global_variables: Vec<GlobalVariable>,
 }
 
+type SyscallHandler = fn(&mut Unicorn<'_, ()>, u32, EmulationContext);
+
 pub struct FunctionHandler {
     pub name: String,
 
@@ -17,10 +19,30 @@ pub struct FunctionHandler {
 
     /// Syscall handler for this function
     /// Second parameter is the offset inside the entrypoint code, measured in instructions
-    pub syscall_handler: fn(&mut Unicorn<'_, ()>, u32, &EmulationContext),
+    pub syscall_handler: SyscallHandler,
 }
 
 impl FunctionHandler {
+    pub fn new(name: String, syscall_handler: SyscallHandler) -> Self {
+        Self {
+            name,
+            entrypoint: None,
+            syscall_handler,
+        }
+    }
+
+    pub fn with_entrypoint(
+        name: String,
+        entrypoint: Vec<u8>,
+        syscall_handler: SyscallHandler,
+    ) -> Self {
+        Self {
+            name,
+            entrypoint: Some(entrypoint),
+            syscall_handler,
+        }
+    }
+
     pub fn entrypoint(&self) -> &[u8] {
         const DEFAULT_ENTRYPOINT: [u8; 8] = [
             0x01, 0x00, 0x00, 0xD4, // SVC #0

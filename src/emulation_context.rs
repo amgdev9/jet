@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex, RwLock};
 
 use log::{error, info};
 use unicorn_engine::{Arch, HookType, Mode, Prot, RegisterARM64, Unicorn};
@@ -10,25 +6,25 @@ use unicorn_engine::{Arch, HookType, Mode, Prot, RegisterARM64, Unicorn};
 use crate::{
     allocator::Allocator,
     arch::{INSTRUCTION_SIZE, SVC_INT_NUMBER},
-    host_dynamic_library::{FunctionHandler, HostDynamicLibrary},
+    host_dynamic_library::HostDynamicLibrary,
     mach::MachOFile,
 };
 
 #[derive(Clone)]
 pub struct EmulationContext {
-    pub host_dynamic_libraries: Rc<Vec<HostDynamicLibrary>>,
-    pub macho_files: Rc<RefCell<Vec<MachOFile>>>,
+    pub host_dynamic_libraries: Arc<Vec<HostDynamicLibrary>>,
+    pub macho_files: Arc<RwLock<Vec<MachOFile>>>,
     pub allocator: Arc<Mutex<Allocator>>,
-    pub exit_function_address: Rc<RefCell<Option<u64>>>,
+    pub exit_function_address: Arc<RwLock<Option<u64>>>,
 }
 
 impl EmulationContext {
     pub fn new(host_dynamic_libraries: Vec<HostDynamicLibrary>) -> Self {
         Self {
-            host_dynamic_libraries: Rc::new(host_dynamic_libraries),
-            macho_files: Rc::new(RefCell::new(Vec::new())),
+            host_dynamic_libraries: Arc::new(host_dynamic_libraries),
+            macho_files: Arc::new(RwLock::new(Vec::new())),
             allocator: Arc::new(Mutex::new(Allocator::new())),
-            exit_function_address: Rc::new(RefCell::new(None)),
+            exit_function_address: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -60,19 +56,21 @@ impl EmulationContext {
             let pc = emu.reg_read(RegisterARM64::PC).unwrap() - INSTRUCTION_SIZE as u64; // PC is already incremented
 
             // Check program exit
-            if pc == self_clone.exit_function_address.borrow().unwrap() {
+            if pc == self_clone.exit_function_address.read().unwrap().unwrap() {
                 emu.emu_stop().unwrap();
                 return;
             }
 
             // Match PC with function handler from a host library
-            let mut handler: Option<&FunctionHandler> = None;
-            let mut instruction_offset: Option<u32> = None;
-            for lib in self_clone.macho_files.borrow().iter() {
-                if handler.is_some() {
+            let mut is_handler_called = false;
+            for lib in self_clone.macho_files.read().unwrap().iter() {
+                if is_handler_called {
                     break;
                 }
-                let host_lib = self_clone.host_dynamic_libraries.iter().find(|it| it.path == lib.path);
+                let host_lib = self_clone
+                    .host_dynamic_libraries
+                    .iter()
+                    .find(|it| it.path == lib.path);
                 let Some(host_lib) = host_lib else {
                     continue;
                 };
@@ -85,19 +83,19 @@ impl EmulationContext {
                     let fun_start = symbol.address;
                     let fun_end = fun_start + (possible_handler.entrypoint().len() as u64);
                     if pc >= fun_start && pc < fun_end {
-                        instruction_offset =
-                            Some(((pc - fun_start) / (INSTRUCTION_SIZE as u64)) as u32);
-                        handler = Some(possible_handler);
+                        let instruction_offset =
+                            ((pc - fun_start) / (INSTRUCTION_SIZE as u64)) as u32;
+                        (possible_handler.syscall_handler)(emu, instruction_offset, self_clone.clone());
+                        is_handler_called = true;
                         break;
                     }
                 }
             }
 
-            let Some(handler) = handler else {
+            if !is_handler_called {
                 error!("Symbol at PC={:#x} not found", pc);
                 std::process::exit(1);
-            };
-            (handler.syscall_handler)(emu, instruction_offset.unwrap(), &self_clone);
+            }
         })
         .unwrap();
 

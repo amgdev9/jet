@@ -3,7 +3,6 @@ use std::{
     ops::Range,
     ptr::NonNull,
     thread::{self, ThreadId},
-    u64,
 };
 
 use log::{error, warn};
@@ -16,9 +15,23 @@ pub struct Allocator {
 }
 
 #[derive(Clone)]
+pub struct UnsafeNonNull<T>(NonNull<T>);
+unsafe impl<T> Send for UnsafeNonNull<T> {}
+unsafe impl<T> Sync for UnsafeNonNull<T> {}
+
+impl UnsafeNonNull<u8> {
+    pub fn new(ptr: *mut u8) -> Option<Self> {
+        NonNull::new(ptr).map(Self)
+    }
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.0.as_ptr()
+    }
+}
+
+#[derive(Clone)]
 pub struct Allocation {
     pub address: u64,
-    pub host_address: NonNull<u8>,
+    pub host_address: UnsafeNonNull<u8>, // SAFETY: safe as long as the emulated program treats it safely
     pub size: u64,
     pub mappings: Vec<MemoryMapping>,
     pub status: AllocationStatus,
@@ -100,7 +113,7 @@ impl Allocator {
             return None;
         };
         let host_ptr = unsafe { alloc(Layout::from_size_align(size as usize, 1).unwrap()) };
-        let Some(host_ptr) = NonNull::new(host_ptr) else {
+        let Some(host_ptr) = UnsafeNonNull::new(host_ptr) else {
             return None;
         };
 
