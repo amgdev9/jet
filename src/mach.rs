@@ -1,16 +1,9 @@
-use std::{
-    fs,
-    path::Path,
-    sync::Mutex,
-};
+use std::{fs, path::Path, sync::Mutex};
 
 use goblin::{
     Object,
     mach::{
-        Mach, MachO,
-        constants::{S_LAZY_SYMBOL_POINTERS, S_NON_LAZY_SYMBOL_POINTERS},
-        load_command::{CommandVariant, LoadCommand},
-        segment::{Section, Segment},
+        Mach, MachO, SingleArch, constants::{S_LAZY_SYMBOL_POINTERS, S_NON_LAZY_SYMBOL_POINTERS}, cputype::CPU_TYPE_ARM64, load_command::{CommandVariant, LoadCommand}, segment::{Section, Segment}
     },
 };
 use log::{debug, error, info};
@@ -228,17 +221,25 @@ fn load_host_library(
     };
 }
 
-fn extract_mach<'a>(object: &'a Object<'a>) -> Option<&'a MachO<'a>> {
+fn extract_mach<'a>(object: &'a Object<'a>) -> Option<MachO<'a>> {
     let Object::Mach(mach_container) = object else {
         error!("Not a mach binary");
         return None;
     };
 
     if let Mach::Binary(mach) = mach_container {
-        return Some(mach);
+        return Some(mach.clone());
     }
 
-    todo!("Not a single-arch mach binary, implement fat binaries");
+    if let Mach::Fat(fat) = mach_container {
+        let index = fat.arches().unwrap().iter().position(|it| it.cputype == CPU_TYPE_ARM64).unwrap(); 
+        let container = fat.get(index).unwrap();
+        if let SingleArch::MachO(mach) = container {
+            return Some(mach);
+        }
+    }
+
+    None
 }
 
 fn map_segments(

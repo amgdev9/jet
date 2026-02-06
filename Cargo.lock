@@ -103,7 +103,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "goblin"
 version = "0.10.4"
-source = "git+https://github.com/amgdev9/goblin#f06424fd4a887cc091cd46bd5f872a3354e96362"
+source = "git+https://github.com/amgdev9/goblin#7846eff244a471990a41941949ead2e274d136d9"
 dependencies = [
  "log",
  "plain",
