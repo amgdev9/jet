@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::Mutex,
+};
 
 use goblin::{
     Object,
@@ -34,7 +38,7 @@ impl MachOFile {
     pub fn load_into(
         path: String,
         emu: &mut Unicorn<'_, ()>,
-        allocator: &mut Allocator,
+        allocator: &Mutex<Allocator>,
         host_libs: &Vec<HostDynamicLibrary>,
         container: &mut Vec<Self>,
     ) {
@@ -168,7 +172,7 @@ impl MachOFile {
 
 fn load_host_library(
     host_lib: &HostDynamicLibrary,
-    allocator: &mut Allocator,
+    allocator: &Mutex<Allocator>,
     emu: &mut Unicorn<'_, ()>,
 ) -> MachOFile {
     info!("Loading host library {}...", host_lib.path);
@@ -185,6 +189,8 @@ fn load_host_library(
     let size = global_variables_size + functions_size;
 
     let allocation = allocator
+        .lock()
+        .unwrap()
         .simple_alloc(emu, size as u64, Prot::ALL) // TODO Optimize permissions
         .unwrap();
     let base_addr = allocation.address;
@@ -239,7 +245,7 @@ fn map_segments(
     segments: &Vec<&Segment<'_>>,
     buffer: &[u8],
     emu: &mut Unicorn<'_, ()>,
-    allocator: &mut Allocator,
+    allocator: &Mutex<Allocator>,
 ) -> Allocation {
     let start_addr = segments.iter().map(|it| it.vmaddr).min().unwrap();
     let end_addr = segments
@@ -267,7 +273,11 @@ fn map_segments(
         })
         .collect::<Vec<_>>();
 
-    let allocation = allocator.alloc(emu, total_size, mappings).unwrap();
+    let allocation = allocator
+        .lock()
+        .unwrap()
+        .alloc(emu, total_size, mappings)
+        .unwrap();
 
     segments.iter().filter(|it| it.filesize > 0).for_each(|it| {
         let data = &buffer[it.fileoff as usize..(it.fileoff + it.filesize) as usize];

@@ -1,5 +1,5 @@
 use log::{error, info};
-use unicorn_engine::{Prot, RegisterARM64};
+use unicorn_engine::Prot;
 
 use crate::{
     arch::{INSTRUCTION_SIZE, SVC_OPCODE},
@@ -27,11 +27,10 @@ impl Runner {
         // Load executable file
         {
             let mut macho_files = ctx.macho_files.write().unwrap();
-            let mut allocator = ctx.allocator.lock().unwrap(); // TODO Lock on usage inside MachOFile::load_into
             MachOFile::load_into(
                 path.clone(),
                 &mut emu,
-                &mut allocator,
+                &ctx.allocator,
                 &ctx.host_dynamic_libraries,
                 &mut macho_files,
             );
