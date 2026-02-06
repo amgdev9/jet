@@ -118,13 +118,4 @@ impl EmulationContext {
         emu.emu_start(entrypoint, u64::MAX, 0, 0).unwrap();
         self.allocator.lock().unwrap().garbage_collect_thread(emu);
     }
-
-    pub fn new_thread(&self, entrypoint: u64) {
-        info!("Starting new thread at {:#x}...", entrypoint);
-
-        let mut emu = self.new_emulator();
-        self.start_emulator(&mut emu, entrypoint);
-
-        info!("Thread finished!");
-    }
 }
