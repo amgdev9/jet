@@ -85,7 +85,11 @@ impl EmulationContext {
                     if pc >= fun_start && pc < fun_end {
                         let instruction_offset =
                             ((pc - fun_start) / (INSTRUCTION_SIZE as u64)) as u32;
-                        (possible_handler.syscall_handler)(emu, instruction_offset, self_clone.clone());
+                        (possible_handler.syscall_handler)(
+                            emu,
+                            instruction_offset,
+                            self_clone.clone(),
+                        );
                         is_handler_called = true;
                         break;
                     }
@@ -115,6 +119,8 @@ impl EmulationContext {
     }
 
     pub fn start_emulator(&self, emu: &mut Unicorn<'_, ()>, entrypoint: u64) {
+        let exit_function = self.exit_function_address.read().unwrap().unwrap();
+        emu.reg_write(RegisterARM64::LR, exit_function).unwrap();
         emu.emu_start(entrypoint, u64::MAX, 0, 0).unwrap();
         self.allocator.lock().unwrap().garbage_collect_thread(emu);
     }

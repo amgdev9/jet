@@ -63,7 +63,6 @@ impl Runner {
             .unwrap();
         let exit_function = exit_function_alloc.address;
         emu.mem_write(exit_function, &SVC_OPCODE).unwrap();
-        emu.reg_write(RegisterARM64::LR, exit_function).unwrap();
         ctx.exit_function_address
             .write()
             .unwrap()
