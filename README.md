@@ -8,13 +8,10 @@ This is a PoC of trying to run Mach-O executables for different CPU architecture
 - ✅ Load regular dynamic libraries required by the executable (resolved recursively)
     (*) needs polishing when resolving runtime search paths
 - ✅ Call from host function to emulated function (via a function pointer), preserving program flow
-
-## What's work in progress
-- 🚧 Provide a threading solution using host threads (e.g. instantiating an emulator per thread sharing mapped memory)
+- ✅ Threading works using host threads, creating an emulator instance per thread and sharing memory between them
 
 ## Future goals
 - 🎯 Achieve native execution if executable target cpu matches host cpu
 
 ## What this crate won't do
 - Adhere to any specific ABI, runtime environment or operating system for the execution of Mach-O binaries, although it can be used as a baseline to achieve this.
-
