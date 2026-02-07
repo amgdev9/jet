@@ -2,6 +2,14 @@
 
 This is a PoC of trying to run Mach-O executables for different CPU architectures, using [Unicorn Emulator](https://github.com/unicorn-engine/unicorn) when the CPU architecture does not match the host.
 
+## Installation
+
+You need some system libraries for Unicorn to compile, for debian:
+
+```bash
+sudo apt install cmake libclang-dev pkg-config
+```
+
 ## What's working
 - ✅ Running ARM64 Mach-O binaries on x86_64 Linux
 - ✅ Provide dynamic libraries which run on the host
