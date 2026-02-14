@@ -5,22 +5,20 @@ use crate::{
     emulation_context::EmulationContext, host_dynamic_library::HostDynamicLibrary, mach::MachOFile,
 };
 
-type SetupRuntimeFn = fn(&mut Unicorn<'_, ()>, &EmulationContext);
-
 pub struct Runner {
     context: EmulationContext,
-    setup_runtime: SetupRuntimeFn,
+    setup_runtime: Box<dyn Fn(&mut Unicorn<'_, ()>, &EmulationContext)>, 
 }
 
 impl Runner {
     /// For setup_runtime function, at least it must set LR so the program knows how to exit
     pub fn new(
         host_dynamic_libraries: Vec<HostDynamicLibrary>,
-        setup_runtime: SetupRuntimeFn,
+        setup_runtime: impl Fn(&mut Unicorn<'_, ()>, &EmulationContext) + 'static,
     ) -> Self {
         Self {
             context: EmulationContext::new(host_dynamic_libraries),
-            setup_runtime,
+            setup_runtime: Box::new(setup_runtime),
         }
     }
 
