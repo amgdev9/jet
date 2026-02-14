@@ -202,3 +202,24 @@ impl Allocator {
         self.allocations.retain(|it| !it.mapped_threads.is_empty());
     }
 }
+
+impl Drop for Allocator {
+    fn drop(&mut self) {
+        if !self.allocations.is_empty() {
+            warn!("Allocator dropped without freeing all allocations");
+        }
+
+        for allocation in self.allocations.iter() {
+            unsafe {
+                dealloc(
+                    allocation.host_address.as_ptr(),
+                    Layout::from_size_align(allocation.size as usize, 1).unwrap(),
+                );
+            };
+            self.alloc_impl.free_range(Range {
+                start: allocation.address,
+                end: allocation.address + allocation.size,
+            });
+        }
+    }
+}
