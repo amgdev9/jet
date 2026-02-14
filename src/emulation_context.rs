@@ -15,7 +15,6 @@ pub struct EmulationContext {
     pub host_dynamic_libraries: Arc<Vec<HostDynamicLibrary>>,
     pub macho_files: Arc<RwLock<Vec<MachOFile>>>,
     pub allocator: Arc<Mutex<Allocator>>,
-    pub exit_function_address: Arc<RwLock<Option<u64>>>,
 }
 
 impl EmulationContext {
@@ -24,7 +23,6 @@ impl EmulationContext {
             host_dynamic_libraries: Arc::new(host_dynamic_libraries),
             macho_files: Arc::new(RwLock::new(Vec::new())),
             allocator: Arc::new(Mutex::new(Allocator::new())),
-            exit_function_address: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -55,18 +53,8 @@ impl EmulationContext {
 
             let pc = emu.reg_read(RegisterARM64::PC).unwrap() - INSTRUCTION_SIZE as u64; // PC is already incremented
 
-            // Check program exit
-            if pc == self_clone.exit_function_address.read().unwrap().unwrap() {
-                emu.emu_stop().unwrap();
-                return;
-            }
-
             // Match PC with function handler from a host library
-            let mut is_handler_called = false;
             for lib in self_clone.macho_files.read().unwrap().iter() {
-                if is_handler_called {
-                    break;
-                }
                 let host_lib = self_clone
                     .host_dynamic_libraries
                     .iter()
@@ -90,16 +78,13 @@ impl EmulationContext {
                             instruction_offset,
                             self_clone.clone(),
                         );
-                        is_handler_called = true;
-                        break;
+                        return;
                     }
                 }
             }
 
-            if !is_handler_called {
-                error!("Symbol at PC={:#x} not found", pc);
-                std::process::exit(1);
-            }
+            error!("Symbol at PC={:#x} not found", pc);
+            std::process::exit(1);
         })
         .unwrap();
 
@@ -119,9 +104,25 @@ impl EmulationContext {
     }
 
     pub fn start_emulator(&self, emu: &mut Unicorn<'_, ()>, entrypoint: u64) {
-        let exit_function = self.exit_function_address.read().unwrap().unwrap();
-        emu.reg_write(RegisterARM64::LR, exit_function).unwrap();
         emu.emu_start(entrypoint, u64::MAX, 0, 0).unwrap();
         self.allocator.lock().unwrap().garbage_collect_thread(emu);
+    }
+
+    pub fn resolve_symbol(&self, name: &str) -> Option<u64> {
+        for lib in self.macho_files.read().unwrap().iter() {
+            let host_lib = self
+                .host_dynamic_libraries
+                .iter()
+                .find(|it| it.path == lib.path);
+            if host_lib.is_none() {
+                continue;
+            }
+            for symbol in lib.export_symbols.iter() {
+                if symbol.name == name {
+                    return Some(symbol.address);
+                }
+            }
+        }
+        None
     }
 }

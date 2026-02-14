@@ -1,26 +1,30 @@
 use log::{error, info};
-use unicorn_engine::Prot;
+use unicorn_engine::Unicorn;
 
 use crate::{
-    arch::{INSTRUCTION_SIZE, SVC_OPCODE},
-    emulation_context::EmulationContext,
-    host_dynamic_library::HostDynamicLibrary,
-    mach::MachOFile,
-    runtime::Runtime,
+    emulation_context::EmulationContext, host_dynamic_library::HostDynamicLibrary, mach::MachOFile,
 };
+
+type SetupRuntimeFn = fn(&mut Unicorn<'_, ()>, &EmulationContext);
 
 pub struct Runner {
     context: EmulationContext,
+    setup_runtime: SetupRuntimeFn,
 }
 
 impl Runner {
-    pub fn new(host_dynamic_libraries: Vec<HostDynamicLibrary>) -> Self {
+    /// For setup_runtime function, at least it must set LR so the program knows how to exit
+    pub fn new(
+        host_dynamic_libraries: Vec<HostDynamicLibrary>,
+        setup_runtime: SetupRuntimeFn,
+    ) -> Self {
         Self {
             context: EmulationContext::new(host_dynamic_libraries),
+            setup_runtime,
         }
     }
 
-    pub fn run(&self, path: String, args: Vec<String>, env: Vec<String>) {
+    pub fn run(&self, path: String) {
         let ctx = &self.context;
         let mut emu = ctx.new_emulator();
 
@@ -52,21 +56,7 @@ impl Runner {
 
         info!("Running program at {:#x}...", entrypoint);
 
-        // Setup runtime
-        Runtime::install(&mut emu, &args, &env);
-        let exit_function_alloc = ctx
-            .allocator
-            .lock()
-            .unwrap()
-            .simple_alloc(&mut emu, INSTRUCTION_SIZE as u64, Prot::READ | Prot::EXEC)
-            .unwrap();
-        let exit_function = exit_function_alloc.address;
-        emu.mem_write(exit_function, &SVC_OPCODE).unwrap();
-        ctx.exit_function_address
-            .write()
-            .unwrap()
-            .replace(exit_function);
-
+        (self.setup_runtime)(&mut emu, ctx);
         ctx.start_emulator(&mut emu, entrypoint);
 
         info!("Program finished!");

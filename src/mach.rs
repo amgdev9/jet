@@ -3,7 +3,11 @@ use std::{fs, path::Path, sync::Mutex};
 use goblin::{
     Object,
     mach::{
-        Mach, MachO, SingleArch, constants::{S_LAZY_SYMBOL_POINTERS, S_NON_LAZY_SYMBOL_POINTERS}, cputype::CPU_TYPE_ARM64, load_command::{CommandVariant, LoadCommand}, segment::{Section, Segment}
+        Mach, MachO, SingleArch,
+        constants::{S_LAZY_SYMBOL_POINTERS, S_NON_LAZY_SYMBOL_POINTERS},
+        cputype::CPU_TYPE_ARM64,
+        load_command::{CommandVariant, LoadCommand},
+        segment::{Section, Segment},
     },
 };
 use log::{debug, error, info};
@@ -232,7 +236,12 @@ fn extract_mach<'a>(object: &'a Object<'a>) -> Option<MachO<'a>> {
     }
 
     if let Mach::Fat(fat) = mach_container {
-        let index = fat.arches().unwrap().iter().position(|it| it.cputype == CPU_TYPE_ARM64).unwrap(); 
+        let index = fat
+            .arches()
+            .unwrap()
+            .iter()
+            .position(|it| it.cputype == CPU_TYPE_ARM64)
+            .unwrap();
         let container = fat.get(index).unwrap();
         if let SingleArch::MachO(mach) = container {
             return Some(mach);
